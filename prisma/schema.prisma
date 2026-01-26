@@ -1,0 +1,136 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Household {
+  id                  String   @id @default(uuid()) @db.Uuid
+  timezone            String   // IANA timezone, e.g. "America/New_York"
+  dinnerEarliestLocal String   @default("18:00") @map("dinner_earliest_local") // TIME as string HH:MM
+  dinnerLatestLocal   String   @default("21:00") @map("dinner_latest_local")
+  hasOven             Boolean  @default(true) @map("has_oven")
+  hasStovetop         Boolean  @default(true) @map("has_stovetop")
+  hasBlender          Boolean  @default(false) @map("has_blender")
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  inventoryItems  InventoryItem[]
+  calendarBlocks  CalendarBlock[]
+  plans           Plan[]
+
+  @@map("households")
+}
+
+model InventoryItem {
+  id             String    @id @default(uuid()) @db.Uuid
+  householdId    String    @map("household_id") @db.Uuid
+  canonicalName  String    @map("canonical_name")
+  displayName    String    @map("display_name")
+  quantity       Decimal   @db.Decimal(10, 2)
+  unit           String    // g, kg, ml, l, pcs
+  expirationDate DateTime? @map("expiration_date") @db.Date
+  opened         Boolean   @default(false)
+  location       String    @default("fridge") // fridge, freezer, pantry
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @default(now()) @updatedAt @map("updated_at")
+
+  household        Household         @relation(fields: [householdId], references: [id])
+  planConsumptions PlanConsumption[]
+
+  @@index([householdId, canonicalName])
+  @@index([householdId, expirationDate])
+  @@map("inventory_items")
+}
+
+model Recipe {
+  id                String   @id @default(uuid()) @db.Uuid
+  slug              String   @unique
+  name              String
+  cookTimeMinutes   Int      @map("cook_time_minutes")
+  prepTimeMinutes   Int      @default(0) @map("prep_time_minutes")
+  equipmentRequired String[] @default([]) @map("equipment_required") // oven, stovetop, blender
+  servings          Int      @default(2)
+  instructionsMd    String   @map("instructions_md")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  ingredients RecipeIngredient[]
+  plans       Plan[]
+
+  @@map("recipes")
+}
+
+model RecipeIngredient {
+  id               String  @id @default(uuid()) @db.Uuid
+  recipeId         String  @map("recipe_id") @db.Uuid
+  canonicalName    String  @map("canonical_name")
+  requiredQuantity Decimal @map("required_quantity") @db.Decimal(10, 2)
+  unit             String  // g, kg, ml, l, pcs
+  optional         Boolean @default(false)
+
+  recipe Recipe @relation(fields: [recipeId], references: [id])
+
+  @@map("recipe_ingredients")
+}
+
+model CalendarBlock {
+  id          String   @id @default(uuid()) @db.Uuid
+  householdId String   @map("household_id") @db.Uuid
+  source      String   @default("manual") // manual, google, outlook
+  startsAt    DateTime @map("starts_at")
+  endsAt      DateTime @map("ends_at")
+  title       String?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  household Household @relation(fields: [householdId], references: [id])
+
+  @@map("calendar_blocks")
+}
+
+model Plan {
+  id                  String   @id @default(uuid()) @db.Uuid
+  householdId         String   @map("household_id") @db.Uuid
+  planDateLocal       DateTime @map("plan_date_local") @db.Date
+  selectedRecipeId    String   @map("selected_recipe_id") @db.Uuid
+  status              String   @default("proposed") // proposed, cooked, skipped, overridden
+  feasibleWindowStart DateTime @map("feasible_window_start")
+  feasibleWindowEnd   DateTime @map("feasible_window_end")
+  dpeTraceJson        Json     @map("dpe_trace_json")
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  household      Household          @relation(fields: [householdId], references: [id])
+  selectedRecipe Recipe             @relation(fields: [selectedRecipeId], references: [id])
+  consumptions   PlanConsumption[]
+  groceryAddons  PlanGroceryAddon[]
+
+  @@map("plans")
+}
+
+model PlanConsumption {
+  id               String   @id @default(uuid()) @db.Uuid
+  planId           String   @map("plan_id") @db.Uuid
+  inventoryItemId  String   @map("inventory_item_id") @db.Uuid
+  consumedQuantity Decimal  @map("consumed_quantity") @db.Decimal(10, 2)
+  unit             String
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  plan          Plan          @relation(fields: [planId], references: [id])
+  inventoryItem InventoryItem @relation(fields: [inventoryItemId], references: [id])
+
+  @@map("plan_consumptions")
+}
+
+model PlanGroceryAddon {
+  id               String   @id @default(uuid()) @db.Uuid
+  planId           String   @map("plan_id") @db.Uuid
+  canonicalName    String   @map("canonical_name")
+  requiredQuantity Decimal  @map("required_quantity") @db.Decimal(10, 2)
+  unit             String
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  plan Plan @relation(fields: [planId], references: [id])
+
+  @@map("plan_grocery_addons")
+}
