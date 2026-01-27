@@ -1,14 +1,15 @@
 /**
- * Phase 2: End-to-End Demo Script
+ * Phase 3: End-to-End Demo Script
  *
  * This script demonstrates the complete Josy workflow:
  * 1. Create a household
- * 2. Add inventory items (with urgency)
+ * 2. Add inventory items (with urgency + quantity confidence)
  * 3. Request a dinner plan
- * 4. Show the reasoning trace
+ * 4. Show the reasoning trace (v0.3)
  * 5. Commit the plan
  * 6. Verify inventory was consumed
  * 7. Demonstrate re-plan trigger on inventory change
+ * 8. Demonstrate unknown quantity handling (Option 1 policy)
  *
  * Run with: npx ts-node scripts/demo.ts
  */
@@ -89,13 +90,14 @@ async function main(): Promise<void> {
   // ===== STEP 2: Add Inventory Items =====
   printSection('STEP 2: Add Inventory Items');
 
-  // Add items with different urgencies
+  // Add items with different urgencies and quantity confidence levels
   const inventoryItems = [
     {
       canonical_name: 'salmon fillet',
       display_name: 'Fresh Atlantic Salmon',
       quantity: 400,
       unit: 'g',
+      quantity_confidence: 'exact', // Weighed on scale
       expiration_date: getToday(), // URGENT - expires today!
       location: 'fridge',
     },
@@ -104,6 +106,7 @@ async function main(): Promise<void> {
       display_name: 'Frozen Green Peas',
       quantity: 300,
       unit: 'g',
+      quantity_confidence: 'estimate', // Eyeballed from bag
       expiration_date: getTomorrow(), // Semi-urgent
       location: 'freezer',
     },
@@ -112,6 +115,7 @@ async function main(): Promise<void> {
       display_name: 'Extra Virgin Olive Oil',
       quantity: 500,
       unit: 'ml',
+      quantity_confidence: 'exact',
       // No expiration - pantry item
       location: 'pantry',
     },
@@ -120,6 +124,7 @@ async function main(): Promise<void> {
       display_name: 'Organic Eggs',
       quantity: 6,
       unit: 'pcs',
+      quantity_confidence: 'exact', // Countable
       expiration_date: getNextWeek(), // Not urgent
       location: 'fridge',
     },
@@ -128,6 +133,7 @@ async function main(): Promise<void> {
       display_name: 'Roma Tomatoes',
       quantity: 400,
       unit: 'g',
+      quantity_confidence: 'estimate',
       expiration_date: getNextWeek(),
       location: 'fridge',
     },
@@ -136,6 +142,7 @@ async function main(): Promise<void> {
       display_name: 'Unsalted Butter',
       quantity: 200,
       unit: 'g',
+      quantity_confidence: 'estimate',
       location: 'fridge',
     },
     {
@@ -143,6 +150,7 @@ async function main(): Promise<void> {
       display_name: 'Sourdough Bread',
       quantity: 8,
       unit: 'pcs',
+      quantity_confidence: 'exact',
       location: 'pantry',
     },
   ];
@@ -153,7 +161,8 @@ async function main(): Promise<void> {
       household_id: householdId,
       ...item,
     });
-    console.log(`  + ${item.display_name}: ${item.quantity} ${item.unit}`);
+    const conf = item.quantity_confidence === 'exact' ? '(exact)' : '(estimate)';
+    console.log(`  + ${item.display_name}: ${item.quantity} ${item.unit} ${conf}`);
     if (item.expiration_date === getToday()) {
       console.log(`    *** EXPIRES TODAY - will be prioritized ***`);
     }
@@ -161,7 +170,13 @@ async function main(): Promise<void> {
 
   // Show current inventory
   const inventory = await apiCall('GET', `/v1/inventory?household_id=${householdId}`) as {
-    items: Array<{ canonical_name: string; quantity: number; unit: string; expiration_date: string | null }>;
+    items: Array<{
+      canonical_name: string;
+      quantity: number | null;
+      quantity_confidence: string;
+      unit: string;
+      expiration_date: string | null;
+    }>;
   };
 
   console.log(`\nCurrent inventory (${inventory.items.length} items):`);
@@ -171,7 +186,10 @@ async function main(): Promise<void> {
         ? 'TODAY!'
         : item.expiration_date
       : 'n/a';
-    console.log(`  - ${item.canonical_name}: ${item.quantity} ${item.unit} (expires: ${expiry})`);
+    const qty = item.quantity !== null ? item.quantity : '?';
+    const conf = item.quantity_confidence === 'unknown' ? '(unknown qty)' :
+                 item.quantity_confidence === 'estimate' ? '(est)' : '';
+    console.log(`  - ${item.canonical_name}: ${qty} ${item.unit} ${conf} (expires: ${expiry})`);
   }
 
   // ===== STEP 3: Request Dinner Plan =====
@@ -185,14 +203,25 @@ async function main(): Promise<void> {
     plan_id: string;
     recipe: { slug: string; name: string; total_time_minutes: number };
     why: string[];
-    inventory_to_consume: Array<{ canonical_name: string; consumed_quantity: number; unit: string }>;
+    inventory_to_consume: Array<{
+      canonical_name: string;
+      consumed_quantity: number | null;
+      consumed_unknown: boolean;
+      unit: string;
+    }>;
     grocery_addons: Array<{ canonical_name: string; required_quantity: number; unit: string }>;
     reasoning_trace: {
+      version: string;
       winner: string;
       tie_breaker: string | null;
       eligible_recipes: Array<{ recipe: string; scores: { final: number } }>;
       rejected_recipes: Array<{ recipe: string; reason: string }>;
-      inventory_snapshot: Array<{ canonical_name: string; urgency: number }>;
+      inventory_snapshot: Array<{
+        canonical_name: string;
+        quantity: number | null;
+        quantity_confidence: string;
+        urgency: number;
+      }>;
     };
   };
 
@@ -208,7 +237,11 @@ async function main(): Promise<void> {
 
   console.log('\nInventory to consume:');
   for (const item of plan.inventory_to_consume) {
-    console.log(`  - ${item.canonical_name}: ${item.consumed_quantity} ${item.unit}`);
+    if (item.consumed_unknown) {
+      console.log(`  - ${item.canonical_name}: UNKNOWN QTY (will mark as depleted when cooked)`);
+    } else {
+      console.log(`  - ${item.canonical_name}: ${item.consumed_quantity} ${item.unit}`);
+    }
   }
 
   if (plan.grocery_addons.length > 0) {
@@ -224,16 +257,21 @@ async function main(): Promise<void> {
   printSection('STEP 4: Reasoning Trace (DPE Decision Details)');
 
   const trace = plan.reasoning_trace;
+  console.log(`DPE Version: ${trace.version}`);
 
-  console.log('Inventory urgency scores:');
-  const urgentItems = trace.inventory_snapshot
-    .filter((i) => i.urgency > 0)
+  console.log('\nInventory snapshot with urgency and confidence:');
+  const sortedItems = [...trace.inventory_snapshot]
     .sort((a, b) => b.urgency - a.urgency);
-  for (const item of urgentItems) {
+  for (const item of sortedItems) {
     const urgencyLabel =
-      item.urgency >= 4 ? 'CRITICAL' : item.urgency >= 2 ? 'MODERATE' : 'LOW';
-    console.log(`  - ${item.canonical_name}: urgency=${item.urgency} (${urgencyLabel})`);
+      item.urgency >= 4 ? 'CRITICAL' : item.urgency >= 2 ? 'MODERATE' : item.urgency > 0 ? 'LOW' : '-';
+    const qtyStr = item.quantity !== null ? `${item.quantity}` : '?';
+    const confStr = item.quantity_confidence === 'unknown' ? '[unknown]' :
+                    item.quantity_confidence === 'estimate' ? '[est]' : '';
+    console.log(`  - ${item.canonical_name}: ${qtyStr} ${confStr} (urgency=${item.urgency} ${urgencyLabel})`);
   }
+
+  const urgentItems = trace.inventory_snapshot.filter((i) => i.urgency > 0);
 
   console.log(`\nWinner: ${trace.winner}`);
   if (trace.tie_breaker) {
@@ -351,6 +389,100 @@ async function main(): Promise<void> {
   console.log(`New plan created: ${updatedPlan.plan_id}`);
   console.log(`  Recipe: ${updatedPlan.recipe.name} (${updatedPlan.recipe.slug})`);
 
+  // ===== STEP 8: Demonstrate Unknown Quantity Handling =====
+  printSection('STEP 8: Unknown Quantity Handling (Option 1 Policy)');
+
+  console.log('Creating a new household to demonstrate unknown quantity items...');
+
+  const unknownHousehold = await apiCall('POST', '/v1/households', {
+    name: `Unknown Qty Demo ${Date.now()}`,
+    timezone: 'America/New_York',
+  }) as { id: string };
+
+  console.log(`Created household: ${unknownHousehold.id}`);
+
+  // Add an item with unknown quantity
+  console.log('\nAdding items with different confidence levels:');
+  await apiCall('POST', '/v1/inventory/items', {
+    household_id: unknownHousehold.id,
+    canonical_name: 'salmon fillet',
+    display_name: 'Salmon (exact weight)',
+    quantity: 400,
+    unit: 'g',
+    quantity_confidence: 'exact',
+    expiration_date: getToday(),
+    location: 'fridge',
+  });
+  console.log('  + salmon fillet: 400g (exact) - expires today');
+
+  await apiCall('POST', '/v1/inventory/items', {
+    household_id: unknownHousehold.id,
+    canonical_name: 'frozen peas',
+    display_name: 'Peas (unknown quantity)',
+    quantity: null, // Unknown quantity!
+    unit: 'g',
+    quantity_confidence: 'unknown', // We know we have peas, but not how much
+    location: 'freezer',
+  });
+  console.log('  + frozen peas: UNKNOWN quantity (we have some, but not sure how much)');
+
+  await apiCall('POST', '/v1/inventory/items', {
+    household_id: unknownHousehold.id,
+    canonical_name: 'olive oil',
+    display_name: 'Olive Oil',
+    quantity: 500,
+    unit: 'ml',
+    quantity_confidence: 'exact',
+    location: 'pantry',
+  });
+  console.log('  + olive oil: 500ml (exact)');
+
+  console.log('\nRequesting plan with unknown quantity item...');
+  const unknownPlan = await apiCall('POST', '/v1/plan/tonight', {
+    household_id: unknownHousehold.id,
+    calendar_blocks: [],
+  }) as {
+    plan_id: string;
+    recipe: { slug: string; name: string };
+    inventory_to_consume: Array<{
+      canonical_name: string;
+      consumed_quantity: number | null;
+      consumed_unknown: boolean;
+      unit: string;
+    }>;
+  };
+
+  console.log(`\nSelected recipe: ${unknownPlan.recipe.name}`);
+  console.log('\nInventory allocation:');
+  for (const item of unknownPlan.inventory_to_consume) {
+    if (item.consumed_unknown) {
+      console.log(`  - ${item.canonical_name}: PRESENT (unknown qty, marked for depletion)`);
+      console.log(`    -> Option 1 policy: item counts as "available" but no specific qty allocated`);
+    } else {
+      console.log(`  - ${item.canonical_name}: ${item.consumed_quantity} ${item.unit}`);
+    }
+  }
+
+  console.log('\nCommitting the plan to demonstrate unknown qty depletion...');
+  await apiCall('POST', `/v1/plan/${unknownPlan.plan_id}/commit`, { status: 'cooked' });
+
+  const afterUnknown = await apiCall('GET', `/v1/inventory?household_id=${unknownHousehold.id}`) as {
+    items: Array<{ canonical_name: string; quantity: number | null; quantity_confidence: string }>;
+  };
+
+  console.log('\nInventory after commit:');
+  for (const item of afterUnknown.items) {
+    const qty = item.quantity !== null ? `${item.quantity}` : '?';
+    console.log(`  - ${item.canonical_name}: ${qty} (${item.quantity_confidence})`);
+  }
+
+  // Check if peas are gone (marked as assumed depleted)
+  const peasRemaining = afterUnknown.items.find((i) => i.canonical_name === 'frozen peas');
+  if (!peasRemaining) {
+    console.log('\n  *** Frozen peas marked as "assumed depleted" and removed from inventory ***');
+    console.log('  *** This is Option 1 policy: unknown qty items are depleted on use ***');
+  }
+
   // ===== SUMMARY =====
   printSection('DEMO COMPLETE');
 
@@ -359,7 +491,9 @@ Key observations demonstrated:
 1. DPE prioritizes items expiring soon (urgency scoring)
 2. Plan commits update inventory quantities
 3. Inventory changes invalidate proposed plans (re-plan trigger)
-4. Reasoning trace explains decision-making process
+4. Reasoning trace explains decision-making process (v0.3)
+5. Quantity confidence levels: exact, estimate, unknown
+6. Unknown quantity items use Option 1 policy (present but not quantifiable)
 
 The Josy DPE is deterministic and input-sensitive!
 `);

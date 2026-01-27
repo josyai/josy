@@ -31,9 +31,12 @@ const SYNONYMS: Record<string, string> = {
   // Proteins
   'chicken breasts': 'chicken breast',
   'chicken thighs': 'chicken breast',
+  'chicken': 'chicken breast',
+  'salmon': 'salmon fillet',
   'salmon fillets': 'salmon fillet',
   'salmon filet': 'salmon fillet',
   'salmon filets': 'salmon fillet',
+  'fresh salmon': 'salmon fillet',
   'eggs': 'eggs',
   'egg': 'eggs',
   'canned tuna fish': 'canned tuna',

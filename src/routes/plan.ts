@@ -48,7 +48,27 @@ router.post('/:planId/commit', async (req: Request<{ planId: string }>, res: Res
         });
 
         if (item) {
-          const currentQty = Number(item.quantity);
+          // Handle unknown quantity items - set assumedDepleted instead of decrementing
+          if (consumption.consumedUnknown || consumption.consumedQuantity === null) {
+            await prisma.inventoryItem.update({
+              where: { id: consumption.inventoryItemId },
+              data: { assumedDepleted: true, opened: true },
+            });
+            warnings.push(
+              `UNKNOWN_QTY_CONSUMED: ${item.canonicalName} marked as assumed depleted`
+            );
+            continue;
+          }
+
+          // Handle estimate quantities - log warning
+          if (item.quantityConfidence === 'estimate') {
+            warnings.push(
+              `ESTIMATE_QTY_USED: ${item.canonicalName} (${item.quantity}${item.unit} estimate) - actual may vary`
+            );
+          }
+
+          // Normal quantity deduction
+          const currentQty = item.quantity !== null ? Number(item.quantity) : 0;
           const toConsume = Number(consumption.consumedQuantity);
           let newQty = currentQty - toConsume;
 

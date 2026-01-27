@@ -60,10 +60,15 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
       throw new InvalidInputError('household_id query parameter is required');
     }
 
+    // Include items with quantity > 0 OR unknown confidence (which have null quantity)
     const items = await prisma.inventoryItem.findMany({
       where: {
         householdId,
-        quantity: { gt: 0 },
+        assumedDepleted: false,
+        OR: [
+          { quantity: { gt: 0 } },
+          { quantityConfidence: 'unknown' },
+        ],
       },
       orderBy: [{ expirationDate: 'asc' }, { createdAt: 'asc' }],
     });
@@ -73,7 +78,8 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
         id: item.id,
         canonical_name: item.canonicalName,
         display_name: item.displayName,
-        quantity: Number(item.quantity),
+        quantity: item.quantity !== null ? Number(item.quantity) : null,
+        quantity_confidence: item.quantityConfidence,
         unit: item.unit,
         expiration_date: item.expirationDate
           ? item.expirationDate.toISOString().split('T')[0]
@@ -99,7 +105,15 @@ router.post('/items', async (req: Request, res: Response, next: NextFunction) =>
     const displayName = data.display_name.trim();
     const unit = validateUnit(data.unit);
     const location = validateLocation(data.location);
-    const quantity = clampQuantity(data.quantity);
+    const quantityConfidence = data.quantity_confidence;
+
+    // Handle quantity based on confidence level
+    let quantity: number | null = null;
+    if (quantityConfidence === 'unknown') {
+      quantity = null;
+    } else if (data.quantity !== null && data.quantity !== undefined) {
+      quantity = clampQuantity(data.quantity);
+    }
 
     if (!unit) {
       throw new InvalidInputError(`Invalid unit: ${data.unit}. Valid units: g, kg, ml, l, pcs`);
@@ -111,6 +125,7 @@ router.post('/items', async (req: Request, res: Response, next: NextFunction) =>
         canonicalName,
         displayName,
         quantity,
+        quantityConfidence,
         unit,
         expirationDate: data.expiration_date ? new Date(data.expiration_date) : null,
         opened: data.opened,
@@ -125,7 +140,8 @@ router.post('/items', async (req: Request, res: Response, next: NextFunction) =>
       id: item.id,
       canonical_name: item.canonicalName,
       display_name: item.displayName,
-      quantity: Number(item.quantity),
+      quantity: item.quantity !== null ? Number(item.quantity) : null,
+      quantity_confidence: item.quantityConfidence,
       unit: item.unit,
       plans_invalidated: invalidatedCount,
     });
@@ -151,8 +167,22 @@ router.patch('/items/:id', async (req: Request<{ id: string }>, res: Response, n
     // Build update data with normalization
     const updateData: Record<string, unknown> = {};
 
+    // Handle quantity_confidence first as it affects quantity handling
+    if (data.quantity_confidence !== undefined) {
+      updateData.quantityConfidence = data.quantity_confidence;
+      // If setting to unknown, also clear the quantity
+      if (data.quantity_confidence === 'unknown') {
+        updateData.quantity = null;
+      }
+    }
+
     if (data.quantity !== undefined) {
-      updateData.quantity = clampQuantity(data.quantity);
+      // If quantity is null, set it to null; otherwise clamp it
+      if (data.quantity === null) {
+        updateData.quantity = null;
+      } else {
+        updateData.quantity = clampQuantity(data.quantity);
+      }
     }
 
     if (data.expiration_date !== undefined) {
@@ -185,7 +215,8 @@ router.patch('/items/:id', async (req: Request<{ id: string }>, res: Response, n
       id: item.id,
       canonical_name: item.canonicalName,
       display_name: item.displayName,
-      quantity: Number(item.quantity),
+      quantity: item.quantity !== null ? Number(item.quantity) : null,
+      quantity_confidence: item.quantityConfidence,
       unit: item.unit,
       expiration_date: item.expirationDate
         ? item.expirationDate.toISOString().split('T')[0]

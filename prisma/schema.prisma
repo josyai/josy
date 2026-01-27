@@ -25,17 +25,19 @@ model Household {
 }
 
 model InventoryItem {
-  id             String    @id @default(uuid()) @db.Uuid
-  householdId    String    @map("household_id") @db.Uuid
-  canonicalName  String    @map("canonical_name")
-  displayName    String    @map("display_name")
-  quantity       Decimal   @db.Decimal(10, 2)
-  unit           String    // g, kg, ml, l, pcs
-  expirationDate DateTime? @map("expiration_date") @db.Date
-  opened         Boolean   @default(false)
-  location       String    @default("fridge") // fridge, freezer, pantry
-  createdAt      DateTime  @default(now()) @map("created_at")
-  updatedAt      DateTime  @default(now()) @updatedAt @map("updated_at")
+  id                  String    @id @default(uuid()) @db.Uuid
+  householdId         String    @map("household_id") @db.Uuid
+  canonicalName       String    @map("canonical_name")
+  displayName         String    @map("display_name")
+  quantity            Decimal?  @db.Decimal(10, 2) // nullable for unknown confidence
+  quantityConfidence  String    @default("exact") @map("quantity_confidence") // exact, estimate, unknown
+  unit                String    // g, kg, ml, l, pcs
+  expirationDate      DateTime? @map("expiration_date") @db.Date
+  opened              Boolean   @default(false)
+  location            String    @default("fridge") // fridge, freezer, pantry
+  assumedDepleted     Boolean   @default(false) @map("assumed_depleted") // for unknown qty items
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @default(now()) @updatedAt @map("updated_at")
 
   household        Household         @relation(fields: [householdId], references: [id])
   planConsumptions PlanConsumption[]
@@ -112,7 +114,8 @@ model PlanConsumption {
   id               String   @id @default(uuid()) @db.Uuid
   planId           String   @map("plan_id") @db.Uuid
   inventoryItemId  String   @map("inventory_item_id") @db.Uuid
-  consumedQuantity Decimal  @map("consumed_quantity") @db.Decimal(10, 2)
+  consumedQuantity Decimal? @map("consumed_quantity") @db.Decimal(10, 2) // nullable for unknown
+  consumedUnknown  Boolean  @default(false) @map("consumed_unknown") // true if qty was unknown
   unit             String
   createdAt        DateTime @default(now()) @map("created_at")
 
@@ -133,4 +136,15 @@ model PlanGroceryAddon {
   plan Plan @relation(fields: [planId], references: [id])
 
   @@map("plan_grocery_addons")
+}
+
+model ChatSession {
+  id           String   @id @default(uuid()) @db.Uuid
+  phoneNumber  String   @unique @map("phone_number") // WhatsApp number
+  householdId  String   @map("household_id") @db.Uuid
+  lastPlanId   String?  @map("last_plan_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("chat_sessions")
 }

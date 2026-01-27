@@ -19,19 +19,35 @@ export const CommitPlanRequestSchema = z.object({
   status: z.enum(['cooked', 'skipped', 'overridden']),
 });
 
+// Quantity confidence levels
+export const QuantityConfidenceEnum = z.enum(['exact', 'estimate', 'unknown']);
+export type QuantityConfidence = z.infer<typeof QuantityConfidenceEnum>;
+
 export const CreateInventoryItemRequestSchema = z.object({
   household_id: z.string().uuid(),
   canonical_name: z.string().min(1),
   display_name: z.string().min(1),
-  quantity: z.number().min(0),
+  quantity: z.number().min(0).nullable().optional(),
+  quantity_confidence: QuantityConfidenceEnum.default('exact'),
   unit: z.enum(['g', 'kg', 'ml', 'l', 'pcs']),
   expiration_date: z.string().date().optional(),
   opened: z.boolean().default(false),
   location: z.enum(['fridge', 'freezer', 'pantry']).default('fridge'),
-});
+}).refine(
+  (data) => {
+    // If quantity_confidence is 'unknown', quantity must be null or undefined
+    if (data.quantity_confidence === 'unknown') {
+      return data.quantity === null || data.quantity === undefined;
+    }
+    // Otherwise, quantity must be provided and > 0
+    return data.quantity !== null && data.quantity !== undefined && data.quantity > 0;
+  },
+  { message: 'quantity must be null for unknown confidence, positive number otherwise' }
+);
 
 export const UpdateInventoryItemRequestSchema = z.object({
-  quantity: z.number().min(0).optional(),
+  quantity: z.number().min(0).nullable().optional(),
+  quantity_confidence: QuantityConfidenceEnum.optional(),
   expiration_date: z.string().date().nullable().optional(),
   opened: z.boolean().optional(),
   location: z.enum(['fridge', 'freezer', 'pantry']).optional(),
@@ -55,7 +71,8 @@ export interface TimeInterval {
 export interface InventorySnapshot {
   id: string;
   canonicalName: string;
-  quantity: number;
+  quantity: number | null;
+  quantityConfidence: QuantityConfidence;
   unit: string;
   expirationDate: Date | null;
   createdAt: Date;
@@ -70,7 +87,8 @@ export interface MissingIngredient {
 export interface UsagePlanItem {
   inventoryItemId: string;
   canonicalName: string;
-  consumedQuantity: number;
+  consumedQuantity: number | null; // null for unknown quantity items
+  consumedUnknown: boolean;
   unit: string;
 }
 
@@ -113,7 +131,8 @@ export interface CalendarConstraints {
 
 export interface InventorySnapshotTrace {
   canonical_name: string;
-  quantity: number;
+  quantity: number | null;
+  quantity_confidence: QuantityConfidence;
   unit: string;
   expiration_date: string | null;
   urgency: number;  // 0-5, higher = expiring sooner
@@ -164,7 +183,8 @@ export interface DPETrace {
   inventorySnapshot: Array<{
     id: string;
     canonicalName: string;
-    quantity: number;
+    quantity: number | null;
+    quantityConfidence?: QuantityConfidence;
     unit: string;
     expirationDate: string | null;
   }>;
@@ -211,7 +231,8 @@ export interface PlanTonightResponse {
   inventory_to_consume: Array<{
     inventory_item_id: string;
     canonical_name: string;
-    consumed_quantity: number;
+    consumed_quantity: number | null;
+    consumed_unknown: boolean;
     unit: string;
   }>;
   grocery_addons: Array<{

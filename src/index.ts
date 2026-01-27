@@ -5,17 +5,22 @@ import { planRoutes } from './routes/plan';
 import { inventoryRoutes } from './routes/inventory';
 import { recipeRoutes } from './routes/recipes';
 import { householdRoutes } from './routes/households';
+import { whatsappRoutes } from './routes/whatsapp';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // For Twilio webhooks
 
-// Routes
+// API Routes
 app.use('/v1/plan', planRoutes);
 app.use('/v1/inventory', inventoryRoutes);
 app.use('/v1/recipes', recipeRoutes);
 app.use('/v1/households', householdRoutes);
+
+// WhatsApp Webhook (Phase 4)
+app.use('/webhooks/whatsapp', whatsappRoutes);
 
 // Health check
 app.get('/health', (_req, res) => {

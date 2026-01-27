@@ -39,8 +39,18 @@ export class NoFeasibleTimeWindowError extends AppError {
   }
 }
 
+export interface RejectionSummary {
+  reason: string;
+  count: number;
+}
+
 export class NoEligibleRecipeError extends AppError {
-  constructor(details?: Record<string, unknown>) {
+  constructor(details: {
+    free_interval_minutes: number;
+    totalCandidatesEvaluated: number;
+    rejection_reasons?: RejectionSummary[];
+    all_rejections?: Array<{ recipe: string; reason: string }>;
+  }) {
     super(
       'NO_ELIGIBLE_RECIPE',
       'No eligible recipe fits the time window and equipment constraints.',

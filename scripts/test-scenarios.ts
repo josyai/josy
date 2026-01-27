@@ -527,20 +527,300 @@ async function testCalendarSensitivity(): Promise<TestResult> {
 }
 
 // ============================================================
+// TEST SCENARIO 4: PARTIAL INVENTORY COVERAGE
+// Partial quantity should be allocated, remainder in grocery add-ons
+// ============================================================
+async function testPartialInventoryCoverage(): Promise<TestResult> {
+  const testName = '4. Partial Inventory Coverage';
+  console.log(`\n--- ${testName} ---`);
+
+  try {
+    const householdId = await createHousehold(`test-partial-${Date.now()}`);
+    console.log(`Created household: ${householdId}`);
+
+    // Add partial olive oil for sheet-pan-salmon recipe (needs 30ml, we have 20ml)
+    await addInventoryItem(householdId, {
+      canonical_name: 'salmon fillet',
+      display_name: 'Salmon',
+      quantity: 400,
+      unit: 'g',
+      expiration_date: getToday(),
+      location: 'fridge',
+    });
+    await addInventoryItem(householdId, {
+      canonical_name: 'frozen peas',
+      display_name: 'Frozen Peas',
+      quantity: 200,
+      unit: 'g',
+      expiration_date: getToday(),
+      location: 'freezer',
+    });
+    // Partial olive oil - only 20ml when recipe needs 30ml
+    await addInventoryItem(householdId, {
+      canonical_name: 'olive oil',
+      display_name: 'Olive Oil',
+      quantity: 20,
+      unit: 'ml',
+      location: 'pantry',
+    });
+
+    console.log('Testing partial inventory: 20ml olive oil when recipe needs 30ml');
+    const plan = await planTonight(householdId);
+
+    if (!plan) {
+      return { name: testName, passed: false, details: 'No plan returned' };
+    }
+
+    // Check that the recipe selected is sheet-pan-salmon-peas
+    // and that olive oil appears in grocery_addons with remaining quantity
+    const trace = plan.reasoning_trace as {
+      winner: string;
+      eligible_recipes: Array<{ recipe: string; missing_ingredients: string[] }>;
+    };
+
+    // Get grocery addons from full plan response
+    const fullPlan = await apiCall('POST', '/v1/plan/tonight', {
+      household_id: householdId,
+      calendar_blocks: [],
+    }) as {
+      grocery_addons: Array<{ canonical_name: string; required_quantity: number; unit: string }>;
+      inventory_to_consume: Array<{ canonical_name: string; consumed_quantity: number | null }>;
+    };
+
+    const oliveOilAddon = fullPlan.grocery_addons.find(
+      (g) => g.canonical_name === 'olive oil'
+    );
+    const oliveOilConsumed = fullPlan.inventory_to_consume.find(
+      (c) => c.canonical_name === 'olive oil'
+    );
+
+    const hasPartialAllocation =
+      oliveOilConsumed !== undefined &&
+      oliveOilConsumed.consumed_quantity !== null &&
+      oliveOilConsumed.consumed_quantity > 0;
+    const hasGroceryAddon =
+      oliveOilAddon !== undefined && oliveOilAddon.required_quantity > 0;
+
+    const passed = hasPartialAllocation && hasGroceryAddon;
+    const details = `Consumed: ${oliveOilConsumed?.consumed_quantity || 0}ml, Grocery addon: ${oliveOilAddon?.required_quantity || 0}ml`;
+
+    console.log(`  Olive oil consumed: ${oliveOilConsumed?.consumed_quantity || 0}ml`);
+    console.log(`  Olive oil in grocery add-ons: ${oliveOilAddon?.required_quantity || 0}ml`);
+    console.log(`Result: ${passed ? 'PASSED' : 'FAILED'} - ${details}`);
+    return { name: testName, passed, details };
+
+  } catch (error) {
+    const err = error as Error;
+    console.log(`Result: FAILED - ${err.message}`);
+    return { name: testName, passed: false, details: err.message };
+  }
+}
+
+// ============================================================
+// TEST SCENARIO 5: NULL EXPIRY HANDLING
+// Items with null expiry should work and not beat urgent items
+// ============================================================
+async function testNullExpiryHandling(): Promise<TestResult> {
+  const testName = '5. Null Expiry Handling';
+  console.log(`\n--- ${testName} ---`);
+
+  try {
+    const householdId = await createHousehold(`test-nullexp-${Date.now()}`);
+    console.log(`Created household: ${householdId}`);
+
+    // Add item with no expiry (pantry staple) and item with urgent expiry
+    // The urgent item should win waste scoring, not the null expiry item
+    await addInventoryItem(householdId, {
+      canonical_name: 'salmon fillet',
+      display_name: 'Fresh Salmon',
+      quantity: 400,
+      unit: 'g',
+      expiration_date: getToday(), // URGENT
+      location: 'fridge',
+    });
+    await addInventoryItem(householdId, {
+      canonical_name: 'frozen peas',
+      display_name: 'Frozen Peas',
+      quantity: 200,
+      unit: 'g',
+      expiration_date: getToday(),
+      location: 'freezer',
+    });
+    // Pantry item with NO expiry
+    await addInventoryItem(householdId, {
+      canonical_name: 'olive oil',
+      display_name: 'Olive Oil',
+      quantity: 500,
+      unit: 'ml',
+      // No expiration_date - should have urgency=0
+      location: 'pantry',
+    });
+    // Also add eggs and tomatoes with NO expiry
+    await addInventoryItem(householdId, {
+      canonical_name: 'eggs',
+      display_name: 'Eggs',
+      quantity: 6,
+      unit: 'pcs',
+      // No expiration_date
+      location: 'fridge',
+    });
+    await addInventoryItem(householdId, {
+      canonical_name: 'tomato',
+      display_name: 'Tomatoes',
+      quantity: 200,
+      unit: 'g',
+      // No expiration_date
+      location: 'fridge',
+    });
+    await addInventoryItem(householdId, {
+      canonical_name: 'butter',
+      display_name: 'Butter',
+      quantity: 100,
+      unit: 'g',
+      location: 'fridge',
+    });
+    await addInventoryItem(householdId, {
+      canonical_name: 'bread',
+      display_name: 'Bread',
+      quantity: 4,
+      unit: 'pcs',
+      location: 'pantry',
+    });
+
+    console.log('Testing: Urgent salmon vs non-expiring eggs/tomatoes');
+    const plan = await planTonight(householdId);
+
+    if (!plan) {
+      return { name: testName, passed: false, details: 'No plan returned - DPE crashed on null expiry' };
+    }
+
+    // The salmon (urgent) should cause salmon recipe to be selected
+    const trace = plan.reasoning_trace as {
+      winner: string;
+      inventory_snapshot: Array<{ canonical_name: string; urgency: number }>;
+    };
+
+    // Verify urgency scores - salmon should have high urgency, null-expiry items should have 0
+    const salmonItem = trace.inventory_snapshot.find((i) => i.canonical_name === 'salmon fillet');
+    const eggsItem = trace.inventory_snapshot.find((i) => i.canonical_name === 'eggs');
+
+    const salmonHasUrgency = salmonItem !== undefined && salmonItem.urgency > 0;
+    const eggsHasNoUrgency = eggsItem !== undefined && eggsItem.urgency === 0;
+
+    // Winner should use the urgent item (salmon)
+    const passed = plan.recipe_slug === 'sheet-pan-salmon-peas' && salmonHasUrgency && eggsHasNoUrgency;
+    const details = `Winner: ${plan.recipe_slug}, Salmon urgency: ${salmonItem?.urgency}, Eggs urgency: ${eggsItem?.urgency}`;
+
+    console.log(`  Selected recipe: ${plan.recipe_slug}`);
+    console.log(`  Salmon urgency: ${salmonItem?.urgency}, Eggs urgency: ${eggsItem?.urgency}`);
+    console.log(`Result: ${passed ? 'PASSED' : 'FAILED'} - ${details}`);
+    return { name: testName, passed, details };
+
+  } catch (error) {
+    const err = error as Error;
+    console.log(`Result: FAILED - ${err.message}`);
+    return { name: testName, passed: false, details: err.message };
+  }
+}
+
+// ============================================================
+// TEST SCENARIO 6: NO VIABLE RECIPE ERROR
+// When all recipes rejected, should return proper error with reasons
+// ============================================================
+async function testNoViableRecipeError(): Promise<TestResult> {
+  const testName = '6. No Viable Recipe Error';
+  console.log(`\n--- ${testName} ---`);
+
+  try {
+    const householdId = await createHousehold(`test-noviable-${Date.now()}`);
+    console.log(`Created household: ${householdId}`);
+
+    // Don't add any inventory, then block all but 5 min of evening
+    // This should make all recipes fail (time constraint)
+    const today = getToday();
+    const fixedNowTs = `${today}T22:30:00.000Z`; // 5:30 PM EST
+
+    // Block from 17:35 to 21:00 EST, leaving only 5 min window (17:30-17:35)
+    const blockStart = `${today}T22:35:00.000Z`; // 5:35 PM EST = 22:35 UTC
+    const blockEnd = `${getTomorrow()}T02:00:00.000Z`; // 9:00 PM EST = 02:00 UTC next day
+
+    console.log('Testing: Only 5-min window, expecting NO_FEASIBLE_TIME_WINDOW error');
+
+    // planTonight returns null when it catches NO_FEASIBLE_TIME_WINDOW or NO_ELIGIBLE_RECIPE
+    const plan = await planTonight(householdId, [{
+      starts_at: blockStart,
+      ends_at: blockEnd,
+      title: 'Busy evening',
+    }], fixedNowTs);
+
+    if (plan === null) {
+      // This is the expected behavior - the helper caught the error
+      console.log('  Got expected null result (error properly caught)');
+      console.log('  Verifying API returns correct error format...');
+
+      // Make direct API call to verify error format
+      const response = await fetch(`${BASE_URL}/v1/plan/tonight`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          household_id: householdId,
+          calendar_blocks: [{ starts_at: blockStart, ends_at: blockEnd, title: 'Busy evening' }],
+          now_ts: fixedNowTs,
+        }),
+      });
+
+      const errorBody = await response.json() as { error?: { code?: string; message?: string; details?: unknown } };
+      const hasCorrectCode = errorBody.error?.code === 'NO_FEASIBLE_TIME_WINDOW' ||
+                            errorBody.error?.code === 'NO_ELIGIBLE_RECIPE';
+
+      console.log(`  Error code: ${errorBody.error?.code}`);
+      console.log(`  Error message: ${errorBody.error?.message}`);
+
+      return {
+        name: testName,
+        passed: hasCorrectCode,
+        details: hasCorrectCode
+          ? `Correct error: ${errorBody.error?.code}`
+          : `Unexpected error: ${JSON.stringify(errorBody)}`,
+      };
+    }
+
+    // If we got a plan, the test failed
+    console.log(`  Unexpectedly got a recipe: ${plan.recipe_slug}`);
+    return {
+      name: testName,
+      passed: false,
+      details: `Expected error but got recipe: ${plan.recipe_slug}`,
+    };
+
+  } catch (error) {
+    const err = error as Error;
+    console.log(`Result: FAILED - ${err.message}`);
+    return { name: testName, passed: false, details: err.message };
+  }
+}
+
+// ============================================================
 // MAIN
 // ============================================================
 async function main() {
   console.log('='.repeat(60));
-  console.log('Phase 2: Scripted Test Scenarios');
+  console.log('Phase 3: Scripted Test Scenarios');
   console.log('='.repeat(60));
   console.log(`Base URL: ${BASE_URL}`);
   console.log(`Date: ${new Date().toISOString()}`);
 
   const results: TestResult[] = [];
 
+  // Phase 2 tests
   results.push(await testInventorySensitivity());
   results.push(await testExpirySensitivity());
   results.push(await testCalendarSensitivity());
+
+  // Phase 3 tests
+  results.push(await testPartialInventoryCoverage());
+  results.push(await testNullExpiryHandling());
+  results.push(await testNoViableRecipeError());
 
   // Summary
   console.log('\n' + '='.repeat(60));
