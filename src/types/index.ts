@@ -61,23 +61,6 @@ export interface InventorySnapshot {
   createdAt: Date;
 }
 
-export interface RecipeCandidate {
-  recipeId: string;
-  recipeSlug: string;
-  recipeName: string;
-  totalTimeMinutes: number;
-  eligible: boolean;
-  ineligibilityReason?: string;
-  missingRequired: MissingIngredient[];
-  usagePlan: UsagePlanItem[];
-  scores: {
-    wasteScore: number;
-    spendPenalty: number;
-    timePenalty: number;
-    final: number;
-  };
-}
-
 export interface MissingIngredient {
   canonicalName: string;
   requiredQuantity: number;
@@ -91,6 +74,80 @@ export interface UsagePlanItem {
   unit: string;
 }
 
+// Phase 2: Enhanced Reasoning Trace Types
+
+export interface RecipeScores {
+  waste: number;       // Higher = better (uses expiring items)
+  grocery_penalty: number;  // Lower = better (fewer missing items)
+  time_penalty: number;     // Lower = better (shorter recipes)
+  final: number;       // Combined score (waste - grocery_penalty - time_penalty)
+}
+
+export interface EligibleRecipe {
+  recipe: string;      // Recipe slug
+  eligible: true;
+  rejections: string[];  // Empty for eligible recipes
+  scores: RecipeScores;
+  missing_ingredients: string[];  // List of missing ingredient names
+  uses_inventory: string[];       // List of inventory items used
+}
+
+export interface RejectedRecipe {
+  recipe: string;      // Recipe slug
+  eligible: false;
+  reason: string;      // Why it was rejected
+}
+
+export interface CalendarConstraints {
+  dinner_window: {
+    start: string;
+    end: string;
+  };
+  busy_blocks: Array<{
+    start: string;
+    end: string;
+    title: string | null;
+  }>;
+  available_minutes: number;
+}
+
+export interface InventorySnapshotTrace {
+  canonical_name: string;
+  quantity: number;
+  unit: string;
+  expiration_date: string | null;
+  urgency: number;  // 0-5, higher = expiring sooner
+}
+
+/**
+ * Phase 2 Reasoning Trace - required structure per spec
+ * This trace explains why a decision was made.
+ */
+export interface ReasoningTrace {
+  version: string;
+  generated_at: string;
+
+  // Input state
+  inventory_snapshot: InventorySnapshotTrace[];
+  calendar_constraints: CalendarConstraints;
+
+  // Decision process
+  eligible_recipes: EligibleRecipe[];
+  rejected_recipes: RejectedRecipe[];
+
+  // Output
+  winner: string;           // Recipe slug
+  tie_breaker: string | null;  // What broke the tie, if any
+
+  // Debug info
+  scoring_details: {
+    waste_weight: number;
+    grocery_penalty_per_item: number;
+    time_penalty_factor: number;
+  };
+}
+
+// Legacy DPETrace for backwards compatibility
 export interface DPETrace {
   version: string;
   nowTs: string;
@@ -114,6 +171,26 @@ export interface DPETrace {
   candidates: RecipeCandidate[];
   winner: { recipeSlug: string; finalScore: number } | null;
   warnings: string[];
+
+  // Phase 2: Add reasoning trace
+  reasoning_trace?: ReasoningTrace;
+}
+
+export interface RecipeCandidate {
+  recipeId: string;
+  recipeSlug: string;
+  recipeName: string;
+  totalTimeMinutes: number;
+  eligible: boolean;
+  ineligibilityReason?: string;
+  missingRequired: MissingIngredient[];
+  usagePlan: UsagePlanItem[];
+  scores: {
+    wasteScore: number;
+    spendPenalty: number;
+    timePenalty: number;
+    final: number;
+  };
 }
 
 // API Response Types
@@ -143,6 +220,9 @@ export interface PlanTonightResponse {
     unit: string;
   }>;
   why: string[];
+
+  // Phase 2: Include reasoning trace in response
+  reasoning_trace: ReasoningTrace;
 }
 
 export interface ApiError {

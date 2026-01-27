@@ -10,6 +10,10 @@ import {
   UsagePlanItem,
   DPETrace,
   PlanTonightResponse,
+  ReasoningTrace,
+  EligibleRecipe,
+  RejectedRecipe,
+  InventorySnapshotTrace,
 } from '../types';
 import {
   InvalidInputError,
@@ -18,23 +22,14 @@ import {
 } from '../utils/errors';
 import type { Prisma } from '@prisma/client';
 
-const DPE_VERSION = 'v0.1';
+const DPE_VERSION = 'v0.2';
 
-interface RecipeWithIngredients {
-  id: string;
-  slug: string;
-  name: string;
-  cookTimeMinutes: number;
-  prepTimeMinutes: number;
-  equipmentRequired: string[];
-  instructionsMd: string;
-  ingredients: Array<{
-    canonicalName: string;
-    requiredQuantity: number;
-    unit: string;
-    optional: boolean;
-  }>;
-}
+// Scoring constants - exposed in trace for transparency
+const SCORING = {
+  WASTE_WEIGHT: 1,           // Multiplier for urgency scores
+  GROCERY_PENALTY_PER_ITEM: 10,  // Penalty per missing ingredient
+  TIME_PENALTY_FACTOR: 0.2,  // Penalty per minute of cook time
+};
 
 interface HouseholdConfig {
   timezone: string;
@@ -76,7 +71,6 @@ function subtractBlocks(
   interval: TimeInterval,
   blocks: Array<{ startsAt: Date; endsAt: Date }>
 ): TimeInterval[] {
-  // Sort blocks by start time
   const sortedBlocks = [...blocks].sort(
     (a, b) => a.startsAt.getTime() - b.startsAt.getTime()
   );
@@ -85,42 +79,29 @@ function subtractBlocks(
   let currentStart = interval.start;
 
   for (const block of sortedBlocks) {
-    // Skip blocks that don't overlap with our interval
     if (block.endsAt <= interval.start || block.startsAt >= interval.end) {
       continue;
     }
 
-    // Clamp block to interval bounds
     const blockStart = block.startsAt < interval.start ? interval.start : block.startsAt;
     const blockEnd = block.endsAt > interval.end ? interval.end : block.endsAt;
 
-    // Add free interval before this block if there's space
     if (currentStart < blockStart) {
       const minutes = differenceInMinutes(blockStart, currentStart);
       if (minutes > 0) {
-        freeIntervals.push({
-          start: currentStart,
-          end: blockStart,
-          minutes,
-        });
+        freeIntervals.push({ start: currentStart, end: blockStart, minutes });
       }
     }
 
-    // Move current start past this block
     if (blockEnd > currentStart) {
       currentStart = blockEnd;
     }
   }
 
-  // Add remaining interval after all blocks
   if (currentStart < interval.end) {
     const minutes = differenceInMinutes(interval.end, currentStart);
     if (minutes > 0) {
-      freeIntervals.push({
-        start: currentStart,
-        end: interval.end,
-        minutes,
-      });
+      freeIntervals.push({ start: currentStart, end: interval.end, minutes });
     }
   }
 
@@ -146,13 +127,14 @@ function pickLongestThenEarliest(intervals: TimeInterval[]): TimeInterval | null
 function checkEquipment(
   required: string[],
   household: HouseholdConfig
-): boolean {
+): { ok: boolean; missing: string[] } {
+  const missing: string[] = [];
   for (const eq of required) {
-    if (eq === 'oven' && !household.hasOven) return false;
-    if (eq === 'stovetop' && !household.hasStovetop) return false;
-    if (eq === 'blender' && !household.hasBlender) return false;
+    if (eq === 'oven' && !household.hasOven) missing.push('oven');
+    if (eq === 'stovetop' && !household.hasStovetop) missing.push('stovetop');
+    if (eq === 'blender' && !household.hasBlender) missing.push('blender');
   }
-  return true;
+  return { ok: missing.length === 0, missing };
 }
 
 /**
@@ -166,7 +148,7 @@ function computeUrgency(expirationDate: Date | null, todayLocal: Date): number {
     (expirationDate.getTime() - todayLocal.getTime()) / (1000 * 60 * 60 * 24)
   );
 
-  if (daysToExp < 0) return -1; // Expired, should be filtered out
+  if (daysToExp < 0) return -1; // Expired
   if (daysToExp <= 1) return 5;
   if (daysToExp <= 3) return 3;
   if (daysToExp <= 7) return 1;
@@ -185,18 +167,17 @@ function computeUsageAndMissing(
     optional: boolean;
   }>,
   inventory: InventorySnapshot[],
-  todayLocal: Date
+  _todayLocal: Date
 ): { usagePlan: UsagePlanItem[]; missingRequired: MissingIngredient[] } {
   const usagePlan: UsagePlanItem[] = [];
   const missingRequired: MissingIngredient[] = [];
 
   for (const ing of ingredients) {
-    if (ing.optional) continue; // Skip optional ingredients for v0.1
+    if (ing.optional) continue;
 
     const needed = Number(ing.requiredQuantity);
     let remaining = needed;
 
-    // Find matching inventory items (same canonical name and unit)
     const matchingItems = inventory
       .filter(
         (item) =>
@@ -205,7 +186,6 @@ function computeUsageAndMissing(
           item.quantity > 0
       )
       .sort((a, b) => {
-        // Sort by expiration date (earliest first, nulls last)
         if (a.expirationDate && b.expirationDate) {
           const diff = a.expirationDate.getTime() - b.expirationDate.getTime();
           if (diff !== 0) return diff;
@@ -214,7 +194,6 @@ function computeUsageAndMissing(
         } else if (!a.expirationDate && b.expirationDate) {
           return 1;
         }
-        // Then by created_at (oldest first)
         return a.createdAt.getTime() - b.createdAt.getTime();
       });
 
@@ -230,7 +209,6 @@ function computeUsageAndMissing(
       });
 
       remaining -= toConsume;
-      // Reduce available quantity for subsequent calculations
       item.quantity -= toConsume;
     }
 
@@ -262,10 +240,9 @@ function computeWasteScore(
 
     const urgency = computeUrgency(item.expirationDate, todayLocal);
     if (urgency > 0) {
-      // Weight by fraction of item being used
       const originalQty = item.quantity;
       const fractionUsed = originalQty > 0 ? usage.consumedQuantity / originalQty : 0;
-      score += urgency * fractionUsed;
+      score += urgency * fractionUsed * SCORING.WASTE_WEIGHT;
     }
   }
 
@@ -283,16 +260,13 @@ function generateWhy(
 ): string[] {
   const reasons: string[] = [];
 
-  // Check for items with high urgency
   const urgentItems: string[] = [];
   for (const usage of candidate.usagePlan) {
     const item = originalInventory.find((i) => i.id === usage.inventoryItemId);
     if (item) {
       const urgency = computeUrgency(item.expirationDate, todayLocal);
       if (urgency >= 3) {
-        urgentItems.push(
-          `${item.canonicalName} (urgency=${urgency})`
-        );
+        urgentItems.push(`${item.canonicalName} (urgency=${urgency})`);
       }
     }
   }
@@ -301,7 +275,6 @@ function generateWhy(
     reasons.push(`Uses items expiring soon: ${urgentItems.join(', ')}`);
   }
 
-  // Missing ingredients count
   const missingCount = candidate.missingRequired.length;
   if (missingCount === 0) {
     reasons.push('All required ingredients available in inventory');
@@ -309,12 +282,36 @@ function generateWhy(
     reasons.push(`Requires ${missingCount} missing ingredient${missingCount > 1 ? 's' : ''}`);
   }
 
-  // Time fit
   reasons.push(
     `Fits in your available window (${candidate.totalTimeMinutes} min recipe, ${intervalMinutes} min available)`
   );
 
   return reasons;
+}
+
+/**
+ * Determine which tie-breaker was used to select the winner
+ */
+function determineTieBreaker(
+  winner: RecipeCandidate,
+  runnerUp: RecipeCandidate | null
+): string | null {
+  if (!runnerUp) return null;
+
+  // Check each tie-breaker in order
+  if (winner.scores.final !== runnerUp.scores.final) {
+    return 'highest_final_score';
+  }
+  if (winner.missingRequired.length !== runnerUp.missingRequired.length) {
+    return 'lowest_missing_ingredients';
+  }
+  if (winner.scores.wasteScore !== runnerUp.scores.wasteScore) {
+    return 'highest_waste_score';
+  }
+  if (winner.totalTimeMinutes !== runnerUp.totalTimeMinutes) {
+    return 'shortest_cook_time';
+  }
+  return 'alphabetical_slug';
 }
 
 /**
@@ -342,7 +339,6 @@ export async function planTonight(
   const dinnerEarliest = createTimeOnDate(nowTs, household.dinnerEarliestLocal, tz);
   const dinnerLatest = createTimeOnDate(nowTs, household.dinnerLatestLocal, tz);
 
-  // window_start = max(now + 15m, dinner_earliest)
   const nowPlus15 = addMinutes(nowTs, 15);
   const windowStart = nowPlus15 > dinnerEarliest ? nowPlus15 : dinnerEarliest;
   const windowEnd = dinnerLatest;
@@ -362,7 +358,6 @@ export async function planTonight(
     const startsAt = parseISO(block.starts_at);
     const endsAt = parseISO(block.ends_at);
 
-    // Store for traceability
     await prisma.calendarBlock.create({
       data: {
         householdId,
@@ -411,12 +406,11 @@ export async function planTonight(
     orderBy: [{ expirationDate: 'asc' }, { createdAt: 'asc' }],
   });
 
-  // Filter out expired items
   const inventorySnapshot: InventorySnapshot[] = inventoryRaw
     .filter((item) => {
       if (!item.expirationDate) return true;
       const urgency = computeUrgency(item.expirationDate, todayLocal);
-      return urgency >= 0; // Keep non-expired
+      return urgency >= 0;
     })
     .map((item) => ({
       id: item.id,
@@ -427,8 +421,16 @@ export async function planTonight(
       createdAt: item.createdAt,
     }));
 
-  // Keep a copy for scoring (before mutations)
   const originalInventory = inventorySnapshot.map((i) => ({ ...i }));
+
+  // Build inventory snapshot for trace with urgency
+  const inventorySnapshotTrace: InventorySnapshotTrace[] = originalInventory.map((item) => ({
+    canonical_name: item.canonicalName,
+    quantity: item.quantity,
+    unit: item.unit,
+    expiration_date: item.expirationDate?.toISOString().split('T')[0] || null,
+    urgency: computeUrgency(item.expirationDate, todayLocal),
+  }));
 
   // 5. Load recipes
   const recipes = await prisma.recipe.findMany({
@@ -437,22 +439,31 @@ export async function planTonight(
 
   // 6. Evaluate candidates
   const candidates: RecipeCandidate[] = [];
+  const eligibleRecipesTrace: EligibleRecipe[] = [];
+  const rejectedRecipesTrace: RejectedRecipe[] = [];
 
   for (const recipe of recipes) {
     const totalTime = recipe.prepTimeMinutes + recipe.cookTimeMinutes;
 
     // Check equipment
-    if (!checkEquipment(recipe.equipmentRequired, household)) {
+    const equipmentCheck = checkEquipment(recipe.equipmentRequired, household);
+    if (!equipmentCheck.ok) {
       candidates.push({
         recipeId: recipe.id,
         recipeSlug: recipe.slug,
         recipeName: recipe.name,
         totalTimeMinutes: totalTime,
         eligible: false,
-        ineligibilityReason: 'Missing required equipment',
+        ineligibilityReason: `Missing equipment: ${equipmentCheck.missing.join(', ')}`,
         missingRequired: [],
         usagePlan: [],
         scores: { wasteScore: 0, spendPenalty: 0, timePenalty: 0, final: -Infinity },
+      });
+
+      rejectedRecipesTrace.push({
+        recipe: recipe.slug,
+        eligible: false,
+        reason: `Missing equipment: ${equipmentCheck.missing.join(', ')}`,
       });
       continue;
     }
@@ -465,15 +476,21 @@ export async function planTonight(
         recipeName: recipe.name,
         totalTimeMinutes: totalTime,
         eligible: false,
-        ineligibilityReason: `Recipe requires ${totalTime} min but only ${selectedInterval.minutes} min available`,
+        ineligibilityReason: `Insufficient time: requires ${totalTime} min, only ${selectedInterval.minutes} min available`,
         missingRequired: [],
         usagePlan: [],
         scores: { wasteScore: 0, spendPenalty: 0, timePenalty: 0, final: -Infinity },
       });
+
+      rejectedRecipesTrace.push({
+        recipe: recipe.slug,
+        eligible: false,
+        reason: `Insufficient time: requires ${totalTime} min, only ${selectedInterval.minutes} min available`,
+      });
       continue;
     }
 
-    // Compute usage and missing (use a copy of inventory to allow mutation)
+    // Compute usage and missing
     const invCopy = inventorySnapshot.map((i) => ({ ...i }));
     const ingredientsWithNumbers = recipe.ingredients.map((ing) => ({
       canonicalName: ing.canonicalName,
@@ -489,8 +506,8 @@ export async function planTonight(
 
     // Compute scores
     const wasteScore = computeWasteScore(usagePlan, originalInventory, todayLocal);
-    const spendPenalty = missingRequired.length * 10;
-    const timePenalty = totalTime * 0.2;
+    const spendPenalty = missingRequired.length * SCORING.GROCERY_PENALTY_PER_ITEM;
+    const timePenalty = totalTime * SCORING.TIME_PENALTY_FACTOR;
     const finalScore = wasteScore - spendPenalty - timePenalty;
 
     candidates.push({
@@ -508,6 +525,20 @@ export async function planTonight(
         final: finalScore,
       },
     });
+
+    eligibleRecipesTrace.push({
+      recipe: recipe.slug,
+      eligible: true,
+      rejections: [],
+      scores: {
+        waste: wasteScore,
+        grocery_penalty: spendPenalty,
+        time_penalty: timePenalty,
+        final: finalScore,
+      },
+      missing_ingredients: missingRequired.map((m) => m.canonicalName),
+      uses_inventory: usagePlan.map((u) => u.canonicalName),
+    });
   }
 
   // 7. Select winner
@@ -522,29 +553,54 @@ export async function planTonight(
 
   // Sort by deterministic tie-breakers
   eligibleCandidates.sort((a, b) => {
-    // 1. Higher final score first
     if (b.scores.final !== a.scores.final) {
       return b.scores.final - a.scores.final;
     }
-    // 2. Fewer missing ingredients
     if (a.missingRequired.length !== b.missingRequired.length) {
       return a.missingRequired.length - b.missingRequired.length;
     }
-    // 3. Higher waste score
     if (b.scores.wasteScore !== a.scores.wasteScore) {
       return b.scores.wasteScore - a.scores.wasteScore;
     }
-    // 4. Shorter total time
     if (a.totalTimeMinutes !== b.totalTimeMinutes) {
       return a.totalTimeMinutes - b.totalTimeMinutes;
     }
-    // 5. Lexicographic slug
     return a.recipeSlug.localeCompare(b.recipeSlug);
   });
 
   const winner = eligibleCandidates[0];
+  const runnerUp = eligibleCandidates.length > 1 ? eligibleCandidates[1] : null;
+  const tieBreaker = determineTieBreaker(winner, runnerUp);
 
-  // 8. Build trace
+  // 8. Build Phase 2 reasoning trace
+  const reasoningTrace: ReasoningTrace = {
+    version: DPE_VERSION,
+    generated_at: nowTs.toISOString(),
+    inventory_snapshot: inventorySnapshotTrace,
+    calendar_constraints: {
+      dinner_window: {
+        start: windowStart.toISOString(),
+        end: windowEnd.toISOString(),
+      },
+      busy_blocks: calendarBlocks.map((b) => ({
+        start: b.startsAt.toISOString(),
+        end: b.endsAt.toISOString(),
+        title: b.title,
+      })),
+      available_minutes: selectedInterval.minutes,
+    },
+    eligible_recipes: eligibleRecipesTrace,
+    rejected_recipes: rejectedRecipesTrace,
+    winner: winner.recipeSlug,
+    tie_breaker: tieBreaker,
+    scoring_details: {
+      waste_weight: SCORING.WASTE_WEIGHT,
+      grocery_penalty_per_item: SCORING.GROCERY_PENALTY_PER_ITEM,
+      time_penalty_factor: SCORING.TIME_PENALTY_FACTOR,
+    },
+  };
+
+  // 9. Build legacy trace (with reasoning_trace embedded)
   const trace: DPETrace = {
     version: DPE_VERSION,
     nowTs: nowTs.toISOString(),
@@ -582,9 +638,10 @@ export async function planTonight(
       finalScore: winner.scores.final,
     },
     warnings: [],
+    reasoning_trace: reasoningTrace,
   };
 
-  // 9. Persist plan
+  // 10. Persist plan
   const plan = await prisma.plan.create({
     data: {
       householdId,
@@ -621,7 +678,7 @@ export async function planTonight(
     });
   }
 
-  // 10. Load full recipe for response
+  // 11. Load full recipe for response
   const selectedRecipe = await prisma.recipe.findUnique({
     where: { id: winner.recipeId },
   });
@@ -630,10 +687,10 @@ export async function planTonight(
     throw new Error('Selected recipe not found - this should never happen');
   }
 
-  // 11. Generate why
+  // 12. Generate why
   const why = generateWhy(winner, originalInventory, todayLocal, selectedInterval.minutes);
 
-  // 12. Build response
+  // 13. Build response
   const response: PlanTonightResponse = {
     plan_id: plan.id,
     plan_date_local: todayLocal.toISOString().split('T')[0],
@@ -660,6 +717,7 @@ export async function planTonight(
       unit: m.unit,
     })),
     why,
+    reasoning_trace: reasoningTrace,
   };
 
   return response;
