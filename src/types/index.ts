@@ -263,3 +263,113 @@ export const ErrorCodes = {
   INVALID_PLAN_STATUS: 'INVALID_PLAN_STATUS',
   INTERNAL_ERROR: 'INTERNAL_ERROR',
 } as const;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.5 Module Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Inventory Intelligence Types
+export interface InventoryIntelligenceParseOutput {
+  canonical_name: string;
+  display_name: string;
+  quantity: number | null;
+  quantity_confidence: QuantityConfidence;
+  unit: string;
+  location: 'fridge' | 'freezer' | 'pantry';
+  expiration_date: string | null;  // ISO date string
+  expiration_source: 'user' | 'heuristic' | null;
+  expiry_rule_id: string | null;
+  expiry_confidence: 'high' | 'medium' | 'low' | null;
+}
+
+export interface ExpiryHeuristicResult {
+  rule_id: string;
+  confidence: 'high' | 'medium' | 'low';
+  expires_in_days: number;
+}
+
+export type IngredientCategory = 'protein' | 'dairy' | 'produce' | 'pantry' | 'frozen' | 'other';
+
+// Grocery Normalization Types
+export interface NormalizedGroceryItem {
+  canonical_name: string;
+  display_name: string;
+  total_quantity: number;
+  unit: string;
+  category: IngredientCategory;
+}
+
+export interface NormalizedGroceryList {
+  items: NormalizedGroceryItem[];
+  summary: string;  // One-line human-readable summary
+}
+
+// Event Types
+export const EventTypes = {
+  PLAN_PROPOSED: 'plan_proposed',
+  PLAN_CONFIRMED: 'plan_confirmed',
+  PLAN_SWAPPED: 'plan_swapped',
+  PLAN_COMMITTED: 'plan_committed',
+  INVENTORY_ADDED: 'inventory_added',
+  INVENTORY_USED: 'inventory_used',
+} as const;
+
+export type EventType = typeof EventTypes[keyof typeof EventTypes];
+
+export interface EventPayload {
+  [EventTypes.PLAN_PROPOSED]: { plan_id: string; recipe_slug: string };
+  [EventTypes.PLAN_CONFIRMED]: { plan_id: string; recipe_slug: string };
+  [EventTypes.PLAN_SWAPPED]: { plan_id: string; old_recipe_slug: string; new_recipe_slug: string };
+  [EventTypes.PLAN_COMMITTED]: { plan_id: string; recipe_slug: string; status: 'cooked' | 'skipped' };
+  [EventTypes.INVENTORY_ADDED]: { item_id: string; canonical_name: string; quantity: number | null; unit: string };
+  [EventTypes.INVENTORY_USED]: { item_id: string; canonical_name: string; quantity_used: number | null };
+}
+
+export interface EmitEventOptions<T extends EventType> {
+  householdId: string;
+  eventType: T;
+  payload: EventPayload[T];
+}
+
+export interface EmitEventResult {
+  id: string;
+  timestamp: string;
+}
+
+export interface GetEventsOptions {
+  eventType?: EventType;
+  since?: Date;
+  limit?: number;
+}
+
+// Notification Types
+export interface DinnerNotification {
+  recipe_name: string;
+  why_short: string;
+  grocery_summary: string | null;
+  plan_id: string;
+  actions: {
+    confirm: string;  // e.g., "Sounds good!"
+    swap: string;     // e.g., "Something else"
+  };
+}
+
+// Orchestrator Types
+export interface OrchestratorTonightInput {
+  household_id: string;
+  now_ts?: string;  // ISO datetime string
+  calendar_blocks?: CalendarBlockInput[];
+}
+
+export interface OrchestratorTonightOutput extends PlanTonightResponse {
+  grocery_list_normalized: NormalizedGroceryList | null;
+  assistant_message: string;  // WhatsApp-formatted message
+}
+
+// Enhanced Inventory Snapshot Trace (v0.5)
+export interface InventorySnapshotTraceV05 extends InventorySnapshotTrace {
+  expiration_source: 'user' | 'heuristic' | null;
+  expiry_rule_id: string | null;
+  expiry_confidence: 'high' | 'medium' | 'low' | null;
+  expires_in_days: number | null;
+}

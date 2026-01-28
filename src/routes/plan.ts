@@ -1,18 +1,22 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { prisma } from '../models/prisma';
 import { PlanTonightRequestSchema, CommitPlanRequestSchema } from '../types';
-import { planTonight } from '../services/dpe';
+import { orchestrateTonight } from '../services/orchestrator';
 import { PlanNotFoundError, InvalidPlanStatusError } from '../utils/errors';
 
 const router = Router();
 
 // POST /v1/plan/tonight - Generate a dinner plan for tonight
+// Now uses orchestrateTonight for enhanced response with grocery_list_normalized and assistant_message
 router.post('/tonight', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const data = PlanTonightRequestSchema.parse(req.body);
-    const nowTs = data.now_ts ? new Date(data.now_ts) : new Date();
 
-    const result = await planTonight(data.household_id, nowTs, data.calendar_blocks);
+    const result = await orchestrateTonight({
+      household_id: data.household_id,
+      now_ts: data.now_ts,
+      calendar_blocks: data.calendar_blocks,
+    });
     res.status(200).json(result);
   } catch (err) {
     next(err);

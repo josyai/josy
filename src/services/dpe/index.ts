@@ -12,7 +12,7 @@
  */
 
 import { toZonedTime } from 'date-fns-tz';
-import { addMinutes, differenceInMinutes, startOfDay, parseISO } from 'date-fns';
+import { addMinutes, differenceInMinutes, differenceInDays, startOfDay, parseISO } from 'date-fns';
 import { prisma } from '../../models/prisma';
 import {
   CalendarBlockInput,
@@ -25,6 +25,7 @@ import {
   EligibleRecipe,
   RejectedRecipe,
   InventorySnapshotTrace,
+  InventorySnapshotTraceV05,
 } from '../../types';
 import {
   InvalidInputError,
@@ -236,15 +237,32 @@ export async function planTonight(
 
   const originalInventory = inventorySnapshot.map((i) => ({ ...i }));
 
-  // Build inventory snapshot for trace with urgency
-  const inventorySnapshotTrace: InventorySnapshotTrace[] = originalInventory.map((item) => ({
-    canonical_name: item.canonicalName,
-    quantity: item.quantity,
-    quantity_confidence: item.quantityConfidence,
-    unit: item.unit,
-    expiration_date: item.expirationDate?.toISOString().split('T')[0] || null,
-    urgency: computeUrgency(item.expirationDate, todayLocal),
-  }));
+  // Build inventory snapshot for trace with urgency and v0.5 expiry metadata
+  const inventorySnapshotTrace: InventorySnapshotTraceV05[] = inventoryRaw
+    .filter((item) => {
+      if (!item.expirationDate) return true;
+      const urgency = computeUrgency(item.expirationDate, todayLocal);
+      return urgency >= 0;
+    })
+    .map((item) => {
+      const expiresInDays = item.expirationDate
+        ? differenceInDays(item.expirationDate, todayLocal)
+        : null;
+
+      return {
+        canonical_name: item.canonicalName,
+        quantity: item.quantity !== null ? Number(item.quantity) : null,
+        quantity_confidence: item.quantityConfidence as 'exact' | 'estimate' | 'unknown',
+        unit: item.unit,
+        expiration_date: item.expirationDate?.toISOString().split('T')[0] || null,
+        urgency: computeUrgency(item.expirationDate, todayLocal),
+        // v0.5 expiry metadata
+        expiration_source: (item.expirationSource as 'user' | 'heuristic') || null,
+        expiry_rule_id: item.expiryRuleId || null,
+        expiry_confidence: (item.expiryConfidence as 'high' | 'medium' | 'low') || null,
+        expires_in_days: expiresInDays,
+      };
+    });
 
   // ─────────────────────────────────────────────────────────────
   // STEP 5: Load recipes and evaluate candidates

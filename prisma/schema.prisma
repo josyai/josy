@@ -33,6 +33,9 @@ model InventoryItem {
   quantityConfidence  String    @default("exact") @map("quantity_confidence") // exact, estimate, unknown
   unit                String    // g, kg, ml, l, pcs
   expirationDate      DateTime? @map("expiration_date") @db.Date
+  expirationSource    String?   @map("expiration_source") // user, heuristic
+  expiryRuleId        String?   @map("expiry_rule_id") // Reference to which expiry rule was used
+  expiryConfidence    String?   @map("expiry_confidence") // high, medium, low
   opened              Boolean   @default(false)
   location            String    @default("fridge") // fridge, freezer, pantry
   assumedDepleted     Boolean   @default(false) @map("assumed_depleted") // for unknown qty items
@@ -54,6 +57,7 @@ model Recipe {
   cookTimeMinutes   Int      @map("cook_time_minutes")
   prepTimeMinutes   Int      @default(0) @map("prep_time_minutes")
   equipmentRequired String[] @default([]) @map("equipment_required") // oven, stovetop, blender
+  tags              String[] @default([]) // e.g., quick, vegetarian, comfort-food
   servings          Int      @default(2)
   instructionsMd    String   @map("instructions_md")
   createdAt         DateTime @default(now()) @map("created_at")
@@ -147,4 +151,26 @@ model ChatSession {
   updatedAt    DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@map("chat_sessions")
+}
+
+model EventLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  householdId String   @map("household_id") @db.Uuid
+  eventType   String   @map("event_type") // plan_proposed, plan_confirmed, plan_swapped, plan_committed, inventory_added, inventory_used
+  payload     Json     // Event-specific data
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([householdId, eventType])
+  @@index([householdId, createdAt])
+  @@map("event_logs")
+}
+
+model PreferenceSnapshot {
+  id           String   @id @default(uuid()) @db.Uuid
+  householdId  String   @map("household_id") @db.Uuid
+  snapshotJson Json     @map("snapshot_json") // Full preferences state at point in time
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([householdId, createdAt])
+  @@map("preference_snapshots")
 }
