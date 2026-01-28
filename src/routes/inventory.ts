@@ -150,6 +150,123 @@ router.post('/items', async (req: Request, res: Response, next: NextFunction) =>
   }
 });
 
+// PUT /v1/inventory/items - Upsert inventory item (merge if exists)
+// Merge keys: household_id + canonical_name + unit
+// Merge behavior:
+// - exact + exact -> exact (sum quantities)
+// - any estimate -> estimate
+// - unknown stays unknown unless numeric arrives
+router.put('/items', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const data = CreateInventoryItemRequestSchema.parse(req.body);
+
+    // Normalize inputs
+    const canonicalName = canonicalizeIngredientName(data.canonical_name);
+    const displayName = data.display_name.trim();
+    const unit = validateUnit(data.unit);
+    const location = validateLocation(data.location);
+    const quantityConfidence = data.quantity_confidence;
+
+    if (!unit) {
+      throw new InvalidInputError(`Invalid unit: ${data.unit}. Valid units: g, kg, ml, l, pcs`);
+    }
+
+    // Handle quantity based on confidence level
+    let inputQuantity: number | null = null;
+    if (quantityConfidence === 'unknown') {
+      inputQuantity = null;
+    } else if (data.quantity !== null && data.quantity !== undefined) {
+      inputQuantity = clampQuantity(data.quantity);
+    }
+
+    // Check for existing item with same household + canonical_name + unit
+    const existing = await prisma.inventoryItem.findFirst({
+      where: {
+        householdId: data.household_id,
+        canonicalName,
+        unit,
+        assumedDepleted: false,
+      },
+    });
+
+    let item;
+    let merged = false;
+
+    if (existing) {
+      // Merge logic
+      merged = true;
+      const existingQty = existing.quantity !== null ? Number(existing.quantity) : 0;
+      const newQty = existingQty + (inputQuantity || 0);
+
+      // Determine merged confidence:
+      // - If either is unknown and numeric arrives, upgrade to estimate
+      // - If both exact, stay exact
+      // - Otherwise estimate
+      let mergedConfidence: string;
+      if (existing.quantityConfidence === 'unknown' && inputQuantity !== null) {
+        mergedConfidence = 'estimate';
+      } else if (quantityConfidence === 'unknown') {
+        mergedConfidence = existing.quantityConfidence;
+      } else if (existing.quantityConfidence === 'exact' && quantityConfidence === 'exact') {
+        mergedConfidence = 'exact';
+      } else {
+        mergedConfidence = 'estimate';
+      }
+
+      // Pick earlier expiration date if both present
+      let mergedExpiration = existing.expirationDate;
+      if (data.expiration_date) {
+        const newExpiration = new Date(data.expiration_date);
+        if (!mergedExpiration || newExpiration < mergedExpiration) {
+          mergedExpiration = newExpiration;
+        }
+      }
+
+      item = await prisma.inventoryItem.update({
+        where: { id: existing.id },
+        data: {
+          quantity: newQty,
+          quantityConfidence: mergedConfidence,
+          expirationDate: mergedExpiration,
+          displayName, // Update display name to latest
+          assumedDepleted: false,
+        },
+      });
+    } else {
+      // Create new item
+      item = await prisma.inventoryItem.create({
+        data: {
+          householdId: data.household_id,
+          canonicalName,
+          displayName,
+          quantity: inputQuantity,
+          quantityConfidence,
+          unit,
+          expirationDate: data.expiration_date ? new Date(data.expiration_date) : null,
+          opened: data.opened,
+          location,
+        },
+      });
+    }
+
+    // Invalidate any proposed plans for today (re-plan trigger)
+    const invalidatedCount = await invalidateProposedPlans(data.household_id);
+
+    res.status(merged ? 200 : 201).json({
+      id: item.id,
+      canonical_name: item.canonicalName,
+      display_name: item.displayName,
+      quantity: item.quantity !== null ? Number(item.quantity) : null,
+      quantity_confidence: item.quantityConfidence,
+      unit: item.unit,
+      merged,
+      plans_invalidated: invalidatedCount,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // PATCH /v1/inventory/items/:id - Update inventory item
 router.patch('/items/:id', async (req: Request<{ id: string }>, res: Response, next: NextFunction) => {
   try {

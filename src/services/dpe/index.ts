@@ -83,6 +83,69 @@ export async function planTonight(
   const todayLocal = startOfDay(nowLocal);
 
   // ─────────────────────────────────────────────────────────────
+  // STEP 1.5: Check for existing proposed plan (idempotency)
+  // If a valid proposed plan exists for today, return it instead
+  // of creating a new one. Inventory changes invalidate plans via
+  // the "overridden" status, which triggers recomputation.
+  // ─────────────────────────────────────────────────────────────
+  const existingPlan = await prisma.plan.findFirst({
+    where: {
+      householdId,
+      planDateLocal: todayLocal,
+      status: 'proposed',
+    },
+    include: {
+      selectedRecipe: true,
+      consumptions: {
+        include: { inventoryItem: true },
+      },
+      groceryAddons: true,
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  if (existingPlan) {
+    // Return existing plan without recomputing
+    const trace = existingPlan.dpeTraceJson as unknown as { reasoning_trace: ReasoningTrace };
+
+    const response: PlanTonightResponse = {
+      plan_id: existingPlan.id,
+      plan_date_local: todayLocal.toISOString().split('T')[0],
+      feasible_window: {
+        start: existingPlan.feasibleWindowStart.toISOString(),
+        end: existingPlan.feasibleWindowEnd.toISOString(),
+      },
+      recipe: {
+        id: existingPlan.selectedRecipe.id,
+        slug: existingPlan.selectedRecipe.slug,
+        name: existingPlan.selectedRecipe.name,
+        total_time_minutes: existingPlan.selectedRecipe.prepTimeMinutes + existingPlan.selectedRecipe.cookTimeMinutes,
+        instructions_md: existingPlan.selectedRecipe.instructionsMd,
+      },
+      inventory_to_consume: existingPlan.consumptions.map((c) => ({
+        inventory_item_id: c.inventoryItemId,
+        canonical_name: c.inventoryItem.canonicalName,
+        consumed_quantity: c.consumedQuantity ? Number(c.consumedQuantity) : null,
+        consumed_unknown: c.consumedUnknown,
+        unit: c.unit,
+      })),
+      grocery_addons: existingPlan.groceryAddons.map((g) => ({
+        canonical_name: g.canonicalName,
+        required_quantity: Number(g.requiredQuantity),
+        unit: g.unit,
+      })),
+      why: trace.reasoning_trace.eligible_recipes
+        .find((r) => r.recipe === trace.reasoning_trace.winner)?.uses_inventory
+        .length === 0
+        ? ['Quick and easy with what you have.']
+        : ['Uses ingredients you already have.'],
+      reasoning_trace: trace.reasoning_trace,
+    };
+
+    return response;
+  }
+
+  // ─────────────────────────────────────────────────────────────
   // STEP 2: Compute dinner window
   // ─────────────────────────────────────────────────────────────
   const dinnerEarliest = createTimeOnDate(nowTs, household.dinnerEarliestLocal, tz);
@@ -101,23 +164,15 @@ export async function planTonight(
   }
 
   // ─────────────────────────────────────────────────────────────
-  // STEP 3: Process calendar blocks and compute free intervals
+  // STEP 3: Process calendar blocks (ephemeral - not persisted)
+  // Calendar blocks are treated as request context, not stored in DB
+  // to avoid pollution from repeated /plan/tonight calls.
   // ─────────────────────────────────────────────────────────────
   const calendarBlocks: Array<{ startsAt: Date; endsAt: Date; source: string; title: string | null }> = [];
 
   for (const block of calendarBlocksInput) {
     const startsAt = parseISO(block.starts_at);
     const endsAt = parseISO(block.ends_at);
-
-    await prisma.calendarBlock.create({
-      data: {
-        householdId,
-        source: block.source,
-        startsAt,
-        endsAt,
-        title: block.title || null,
-      },
-    });
 
     calendarBlocks.push({
       startsAt,

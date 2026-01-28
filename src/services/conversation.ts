@@ -20,6 +20,7 @@ import {
 import { planTonight } from './dpe';
 import { canonicalizeIngredientName, validateUnit } from '../utils/canonicalize';
 import { ReasoningTrace } from '../types';
+import { AppError } from '../utils/errors';
 
 export interface ConversationResponse {
   message: string;
@@ -102,23 +103,24 @@ async function handlePlanTonight(householdId: string, phoneNumber: string): Prom
 
     return { message, success: true };
   } catch (error) {
-    const err = error as Error;
+    // Use AppError.code for reliable error matching
+    if (error instanceof AppError) {
+      if (error.code === 'NO_FEASIBLE_TIME_WINDOW') {
+        return {
+          message: "It's too late for dinner tonight! Try again tomorrow.",
+          success: false,
+        };
+      }
 
-    if (err.message.includes('NO_FEASIBLE_TIME_WINDOW')) {
-      return {
-        message: "It's too late for dinner tonight! Try again tomorrow.",
-        success: false,
-      };
+      if (error.code === 'NO_ELIGIBLE_RECIPE') {
+        return {
+          message: "I couldn't find a recipe that fits your schedule. Try adding some ingredients first!",
+          success: false,
+        };
+      }
     }
 
-    if (err.message.includes('NO_ELIGIBLE_RECIPE')) {
-      return {
-        message: "I couldn't find a recipe that fits your schedule. Try adding some ingredients first!",
-        success: false,
-      };
-    }
-
-    console.error('Plan error:', err);
+    console.error('Plan error:', error);
     return {
       message: 'Something went wrong. Please try again.',
       success: false,
