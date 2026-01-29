@@ -17,6 +17,9 @@ import {
   EmitEventOptions,
   EmitEventResult,
   GetEventsOptions,
+  EventTypeV06,
+  EventTypesV06,
+  EventPayloadV06,
 } from '../../types';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -233,5 +236,66 @@ export async function getLatestPreferenceSnapshot(
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.6 Event Functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Emit a v0.6 event to the event log.
+ * This is fire-and-forget - errors are logged but don't throw.
+ *
+ * @param options - Event options including householdId, eventType, and payload
+ * @returns Event ID and timestamp
+ */
+export async function emitEventV06<T extends EventTypeV06>(
+  options: {
+    householdId: string;
+    eventType: T;
+    payload: T extends keyof EventPayloadV06 ? EventPayloadV06[T] : never;
+  }
+): Promise<EmitEventResult> {
+  const { householdId, eventType, payload } = options;
+  const id = uuidv4();
+  const timestamp = new Date().toISOString();
+
+  try {
+    await prisma.eventLog.create({
+      data: {
+        id,
+        householdId,
+        eventType,
+        payload: payload as object,
+      },
+    });
+  } catch (error) {
+    console.error(`[Events] Failed to emit ${eventType} event:`, error);
+  }
+
+  return { id, timestamp };
+}
+
+/**
+ * Emit a consumption_logged event for variety tracking (v0.6).
+ */
+export function emitConsumptionLogged(
+  householdId: string,
+  dateLocal: string,
+  recipeSlug: string,
+  ingredientsUsed: string[],
+  tags: string[]
+): Promise<EmitEventResult> {
+  return emitEventV06({
+    householdId,
+    eventType: EventTypesV06.CONSUMPTION_LOGGED,
+    payload: {
+      plan_id: '', // Not always available
+      recipe_slug: recipeSlug,
+      date_local: dateLocal,
+      ingredients_used: ingredientsUsed,
+      tags,
+    },
+  });
+}
+
 // Re-export types
-export { EventTypes };
+export { EventTypes, EventTypesV06 };

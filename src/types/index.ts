@@ -373,3 +373,239 @@ export interface InventorySnapshotTraceV05 extends InventorySnapshotTrace {
   expiry_confidence: 'high' | 'medium' | 'low' | null;
   expires_in_days: number | null;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.6 Planning Horizon Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Horizon Modes
+export const HorizonModes = {
+  NEXT_MEAL: 'NEXT_MEAL',
+  NEXT_N_DINNERS: 'NEXT_N_DINNERS',
+  DATE_RANGE: 'DATE_RANGE',
+} as const;
+
+export type HorizonMode = typeof HorizonModes[keyof typeof HorizonModes];
+
+// Horizon Schema
+export const HorizonSchema = z.object({
+  mode: z.enum(['NEXT_MEAL', 'NEXT_N_DINNERS', 'DATE_RANGE']),
+  n_dinners: z.number().int().min(1).max(7).optional(),
+  start_date_local: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  end_date_local: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+}).refine(
+  (data) => {
+    if (data.mode === 'NEXT_N_DINNERS') {
+      return data.n_dinners !== undefined && data.n_dinners >= 1 && data.n_dinners <= 7;
+    }
+    if (data.mode === 'DATE_RANGE') {
+      return data.start_date_local !== undefined && data.end_date_local !== undefined;
+    }
+    return true;
+  },
+  { message: 'Invalid horizon configuration for the specified mode' }
+);
+
+export type Horizon = z.infer<typeof HorizonSchema>;
+
+// Intent Override for a specific day
+export const IntentOverrideSchema = z.object({
+  date_local: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  must_include: z.array(z.string()).optional(),
+  must_exclude: z.array(z.string()).optional(),
+  preferred_recipe_tags: z.array(z.string()).optional(),
+  preferred_recipe_slugs: z.array(z.string()).optional(),
+});
+
+export type IntentOverride = z.infer<typeof IntentOverrideSchema>;
+
+// Plan Options
+export const PlanOptionsSchema = z.object({
+  exclude_recipe_slugs: z.array(z.string()).optional(),
+  variety_window_days: z.number().int().min(3).max(10).default(7),
+  stability_band_pct: z.number().min(0).max(50).default(10),
+  force_recompute: z.boolean().default(false),
+});
+
+export type PlanOptions = z.infer<typeof PlanOptionsSchema>;
+
+// POST /v1/plan Request Schema
+export const PlanRequestSchema = z.object({
+  household_id: z.string().uuid(),
+  now_ts: z.string().datetime().optional(),
+  calendar_blocks: z.array(CalendarBlockInputSchema).default([]),
+  horizon: HorizonSchema,
+  intent_overrides: z.array(IntentOverrideSchema).default([]),
+  options: PlanOptionsSchema.optional(),
+});
+
+export type PlanRequest = z.infer<typeof PlanRequestSchema>;
+
+// Per-Day Plan Response
+export interface PlanDayResponse {
+  date_local: string;
+  meal_slot: 'DINNER';
+  plan_id: string;
+  recipe: {
+    slug: string;
+    name: string;
+    total_time_minutes: number;
+  };
+  inventory_to_consume: Array<{
+    inventory_item_id: string;
+    canonical_name: string;
+    consumed_quantity: number | null;
+    consumed_unknown: boolean;
+    unit: string;
+  }>;
+  grocery_addons: Array<{
+    canonical_name: string;
+    required_quantity: number;
+    unit: string;
+  }>;
+  grocery_list_normalized: NormalizedGroceryList | null;
+  assistant_message: string;
+  reasoning_trace: ReasoningTrace;
+}
+
+// Variety Penalty Info for trace
+export interface VarietyPenaltyApplied {
+  ingredient: string;
+  last_consumed_date: string;
+  days_since: number;
+  penalty_points: number;
+  reason: string;
+}
+
+// Stability Decision for trace
+export interface StabilityDecision {
+  date_local: string;
+  kept_recipe: string | null;
+  new_best_recipe: string;
+  decision: 'kept' | 'changed';
+  reason: string;
+  old_score: number | null;
+  new_score: number;
+  within_band: boolean;
+}
+
+// Dependency Change for trace
+export interface DependencyChange {
+  date_local: string;
+  reason: string;
+  old_recipe: string;
+  new_recipe: string;
+}
+
+// PlanSet Reasoning Trace
+export interface PlanSetReasoningTrace {
+  inputs_summary: {
+    horizon: Horizon;
+    intent_overrides_count: number;
+    inventory_item_count: number;
+    calendar_blocks_count: number;
+  };
+  recent_consumption_summary: {
+    days_looked_back: number;
+    meals_found: number;
+    ingredients_consumed: string[];
+  };
+  variety_penalties_applied: Record<string, VarietyPenaltyApplied[]>; // keyed by date_local
+  stability_decisions: StabilityDecision[];
+  dependency_changes: DependencyChange[];
+  per_day: Record<string, ReasoningTrace>; // keyed by date_local
+}
+
+// POST /v1/plan Response
+export interface PlanResponse {
+  plan_set_id: string;
+  horizon: Horizon;
+  days: PlanDayResponse[];
+  grocery_list_normalized: NormalizedGroceryList | null;
+  assistant_message: string;
+  reasoning_trace: PlanSetReasoningTrace;
+}
+
+// Swap Request
+export const SwapRequestSchema = z.object({
+  date_local: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  exclude_recipe_slugs: z.array(z.string()).optional(),
+});
+
+export type SwapRequest = z.infer<typeof SwapRequestSchema>;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.6 Extended Event Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const EventTypesV06 = {
+  ...EventTypes,
+  PLAN_SET_PROPOSED: 'plan_set_proposed',
+  PLAN_SET_CONFIRMED: 'plan_set_confirmed',
+  PLAN_SET_OVERRIDDEN: 'plan_set_overridden',
+  PLAN_SET_ITEM_SWAPPED: 'plan_set_item_swapped',
+  CONSUMPTION_LOGGED: 'consumption_logged',
+} as const;
+
+export type EventTypeV06 = typeof EventTypesV06[keyof typeof EventTypesV06];
+
+export interface EventPayloadV06 extends EventPayload {
+  [EventTypesV06.PLAN_SET_PROPOSED]: { plan_set_id: string; horizon: Horizon; recipe_slugs: string[] };
+  [EventTypesV06.PLAN_SET_CONFIRMED]: { plan_set_id: string };
+  [EventTypesV06.PLAN_SET_OVERRIDDEN]: { plan_set_id: string; reason: string };
+  [EventTypesV06.PLAN_SET_ITEM_SWAPPED]: { plan_set_id: string; date_local: string; old_recipe_slug: string; new_recipe_slug: string };
+  [EventTypesV06.CONSUMPTION_LOGGED]: { plan_id: string; recipe_slug: string; date_local: string; ingredients_used: string[]; tags: string[] };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.6 Variety Model Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type VarietyCategory = 'pantry_legumes' | 'proteins' | 'produce' | 'other';
+
+export interface VarietyRule {
+  category: VarietyCategory;
+  ingredients: string[];
+  avoid_repeat_days: number;
+  penalty_per_occurrence: number;
+}
+
+export interface ConsumptionRecord {
+  date_local: string;
+  recipe_slug: string;
+  ingredients_used: string[];
+  tags: string[];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.6 DPE Extension Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface ExternalScoringPenalty {
+  recipe_slug: string;
+  penalty_points: number;
+  reason: string;
+}
+
+export interface DPEPlanOptions {
+  exclude_recipe_slugs?: string[];
+  external_penalties?: ExternalScoringPenalty[];
+  must_include_ingredients?: string[];
+  must_exclude_ingredients?: string[];
+  preferred_recipe_slugs?: string[];
+  preferred_recipe_tags?: string[];
+}
+
+// Extended RecipeScores for v0.6
+export interface RecipeScoresV06 extends RecipeScores {
+  variety_penalty: number;
+  intent_boost: number;
+  external_penalty: number;
+}
+
+// Extended EligibleRecipe for v0.6
+export interface EligibleRecipeV06 extends Omit<EligibleRecipe, 'scores'> {
+  scores: RecipeScoresV06;
+  variety_penalties: VarietyPenaltyApplied[];
+  intent_match: boolean;
+}

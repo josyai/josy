@@ -13,6 +13,7 @@ import {
 } from '../utils/canonicalize';
 import { startOfDay } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
+import { invalidatePlanSets } from '../services/replanning';
 
 const router = Router();
 
@@ -22,6 +23,8 @@ const router = Router();
  *
  * Re-plan is pull-based (v0.1): we don't auto-recompute,
  * we just invalidate existing proposals.
+ *
+ * v0.6: Also invalidates any proposed PlanSets.
  */
 async function invalidateProposedPlans(householdId: string): Promise<number> {
   // Get household timezone
@@ -47,6 +50,11 @@ async function invalidateProposedPlans(householdId: string): Promise<number> {
     data: {
       status: 'overridden',
     },
+  });
+
+  // v0.6: Also invalidate any proposed PlanSets
+  invalidatePlanSets(householdId, 'inventory_change').catch((err) => {
+    console.error('[Inventory] Failed to invalidate PlanSets:', err);
   });
 
   return result.count;

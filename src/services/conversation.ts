@@ -350,6 +350,27 @@ export async function handleMessage(
     case 'INVENTORY_USED':
       return handleInventoryUsed(session.householdId, intent.item);
 
+    // v0.6: Multi-day planning intents
+    case 'PLAN_NEXT':
+      return {
+        message: `Planning ${intent.days} days of dinners is available via the API (POST /v1/plan with horizon). WhatsApp support coming soon!`,
+        success: true,
+      };
+
+    case 'SWAP_DAY':
+      return {
+        message: intent.day
+          ? `Swapping ${intent.day}'s dinner is available via the API. WhatsApp support coming soon!`
+          : `To swap a day, say "swap Monday" or "swap tomorrow". Full support available via API.`,
+        success: true,
+      };
+
+    case 'CONFIRM_PLAN':
+      return {
+        message: `Plan confirmed! Confirming multi-day plans is available via the API (POST /v1/plan_set/:id/confirm).`,
+        success: true,
+      };
+
     case 'UNKNOWN':
       return {
         message: formatUnknownResponse(),

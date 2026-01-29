@@ -5,4 +5,13 @@
  * See src/services/dpe/ for the full implementation.
  */
 
-export { planTonight, DPE_VERSION, SCORING, computeUrgency, checkEquipment } from './dpe/index';
+export {
+  planTonight,
+  planTonightWithOptions,
+  DPE_VERSION,
+  SCORING,
+  computeUrgency,
+  checkEquipment,
+} from './dpe/index';
+
+export type { DPEOptionsV06 } from './dpe/index';

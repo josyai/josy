@@ -20,6 +20,7 @@ model Household {
   inventoryItems  InventoryItem[]
   calendarBlocks  CalendarBlock[]
   plans           Plan[]
+  planSets        PlanSet[]
 
   @@map("households")
 }
@@ -143,12 +144,13 @@ model PlanGroceryAddon {
 }
 
 model ChatSession {
-  id           String   @id @default(uuid()) @db.Uuid
-  phoneNumber  String   @unique @map("phone_number") // WhatsApp number
-  householdId  String   @map("household_id") @db.Uuid
-  lastPlanId   String?  @map("last_plan_id") @db.Uuid
-  createdAt    DateTime @default(now()) @map("created_at")
-  updatedAt    DateTime @default(now()) @updatedAt @map("updated_at")
+  id            String   @id @default(uuid()) @db.Uuid
+  phoneNumber   String   @unique @map("phone_number") // WhatsApp number
+  householdId   String   @map("household_id") @db.Uuid
+  lastPlanId    String?  @map("last_plan_id") @db.Uuid
+  lastPlanSetId String?  @map("last_plan_set_id") @db.Uuid
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@map("chat_sessions")
 }
@@ -156,7 +158,7 @@ model ChatSession {
 model EventLog {
   id          String   @id @default(uuid()) @db.Uuid
   householdId String   @map("household_id") @db.Uuid
-  eventType   String   @map("event_type") // plan_proposed, plan_confirmed, plan_swapped, plan_committed, inventory_added, inventory_used
+  eventType   String   @map("event_type") // plan_proposed, plan_confirmed, plan_swapped, plan_committed, inventory_added, inventory_used, plan_set_proposed, plan_set_confirmed, plan_set_overridden, plan_set_item_swapped, consumption_logged
   payload     Json     // Event-specific data
   createdAt   DateTime @default(now()) @map("created_at")
 
@@ -173,4 +175,41 @@ model PreferenceSnapshot {
 
   @@index([householdId, createdAt])
   @@map("preference_snapshots")
+}
+
+model PlanSet {
+  id          String   @id @default(uuid()) @db.Uuid
+  householdId String   @map("household_id") @db.Uuid
+  horizonJson Json     @map("horizon_json") // Stores horizon mode, dates, etc.
+  status      String   @default("proposed") // proposed, confirmed, overridden
+  stableKey   String   @map("stable_key") // Deterministic idempotency key
+  traceJson   Json     @default("{}") @map("trace_json") // Reasoning trace for the plan set
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  household Household     @relation(fields: [householdId], references: [id])
+  items     PlanSetItem[]
+
+  @@unique([householdId, stableKey])
+  @@index([householdId, status, createdAt])
+  @@map("plan_sets")
+}
+
+model PlanSetItem {
+  id         String   @id @default(uuid()) @db.Uuid
+  planSetId  String   @map("plan_set_id") @db.Uuid
+  dateLocal  String   @map("date_local") // YYYY-MM-DD
+  mealSlot   String   @default("DINNER") @map("meal_slot")
+  planId     String?  @map("plan_id") @db.Uuid // Reference to Plan row created by DPE
+  recipeSlug String   @map("recipe_slug")
+  status     String   @default("proposed") // proposed, confirmed, overridden
+  traceJson  Json     @default("{}") @map("trace_json") // Per-day trace
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  planSet PlanSet @relation(fields: [planSetId], references: [id])
+
+  @@unique([planSetId, dateLocal, mealSlot])
+  @@index([dateLocal, recipeSlug])
+  @@map("plan_set_items")
 }

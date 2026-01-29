@@ -7,6 +7,9 @@
 
 export type Intent =
   | { type: 'PLAN_TONIGHT' }
+  | { type: 'PLAN_NEXT'; days: number }
+  | { type: 'SWAP_DAY'; day?: string }
+  | { type: 'CONFIRM_PLAN' }
   | { type: 'EXPLAIN_LAST_PLAN' }
   | { type: 'INVENTORY_ADD'; item: string; quantity?: number; unit?: string }
   | { type: 'INVENTORY_USED'; item: string }
@@ -104,7 +107,55 @@ function normalizeItemName(text: string): string {
 export function detectIntent(message: string): Intent {
   const text = message.trim().toLowerCase();
 
-  // Check for dinner/plan intent
+  // v0.6: Check for confirm intent
+  if (
+    text === 'confirm' ||
+    text === 'yes' ||
+    text === 'ok' ||
+    text === 'sounds good' ||
+    text === 'looks good' ||
+    text.startsWith('yes ') ||
+    text.includes('confirm the plan') ||
+    text.includes('that works')
+  ) {
+    return { type: 'CONFIRM_PLAN' };
+  }
+
+  // v0.6: Check for swap intent
+  const swapPatterns = [
+    /^swap\s+(.+)/i,
+    /^change\s+(.+)/i,
+    /^different\s+(?:meal\s+)?(?:for\s+)?(.+)/i,
+    /^something else(?:\s+(?:for\s+)?(.+))?/i,
+  ];
+
+  for (const pattern of swapPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      const day = match[1]?.trim() || undefined;
+      return { type: 'SWAP_DAY', day };
+    }
+  }
+
+  // v0.6: Check for multi-day plan intent
+  const multiDayPatterns = [
+    /plan (?:the )?next (\d+) (?:days?|dinners?)/i,
+    /(?:next|plan) (\d+) (?:days?|dinners?)/i,
+    /plan (?:for )?(?:the )?week/i,
+    /weekly plan/i,
+    /what(?:'s| is) for (?:the )?(?:next|this) (\d+) days/i,
+  ];
+
+  for (const pattern of multiDayPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      // Default to 7 for "week" patterns, otherwise use the number
+      const days = match[1] ? parseInt(match[1], 10) : 7;
+      return { type: 'PLAN_NEXT', days: Math.min(days, 14) }; // Cap at 14 days
+    }
+  }
+
+  // Check for dinner/plan intent (single day - tonight)
   if (
     text.includes('dinner') ||
     text.includes("what's for") ||
