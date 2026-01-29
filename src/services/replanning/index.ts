@@ -49,7 +49,7 @@ import {
 import { planTonightWithOptions, DPEOptionsV06 } from '../dpe';
 import { normalizeGroceryAddons } from '../grocery';
 import { buildDinnerNotification, formatForWhatsApp } from '../notifications';
-import { emitEvent } from '../events';
+import { emitEvent, emitEventV06 } from '../events';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -161,6 +161,7 @@ export async function computePlanSet(
     calendarDigest
   );
 
+  // Check for exact match first (same stable key)
   if (!forceRecompute) {
     const existingPlanSet = await prisma.planSet.findFirst({
       where: {
@@ -183,6 +184,42 @@ export async function computePlanSet(
         response,
         isExisting: true,
       };
+    }
+  }
+
+  // Look up most recent proposed PlanSet for stability band comparison
+  // This handles the case where inputs changed slightly but we might want to keep the old plan
+  const previousPlanSet = !forceRecompute
+    ? await prisma.planSet.findFirst({
+        where: {
+          householdId: household_id,
+          status: 'proposed',
+        },
+        include: {
+          items: {
+            orderBy: { dateLocal: 'asc' },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+      })
+    : null;
+
+  // Map of date -> existing recipe info for stability comparison
+  const existingRecipesByDate = new Map<
+    string,
+    { slug: string; score: number }
+  >();
+  if (previousPlanSet) {
+    for (const item of previousPlanSet.items) {
+      // Use the trace stored in the PlanSetItem to get the score
+      const trace = item.traceJson as ReasoningTrace | null;
+      const score = trace?.eligible_recipes?.find(
+        (r) => r.recipe === item.recipeSlug
+      )?.scores?.final ?? 0;
+      existingRecipesByDate.set(item.dateLocal, {
+        slug: item.recipeSlug,
+        score,
+      });
     }
   }
 
@@ -221,6 +258,7 @@ export async function computePlanSet(
   const usedRecipeSlugsInHorizon: string[] = [];
   const perDayVarietyPenalties: Record<string, VarietyPenaltyApplied[]> = {};
   const perDayTraces: Record<string, ReasoningTrace> = {};
+  const stabilityDecisions: StabilityDecision[] = [];
 
   // Track planned consumption for variety profile updates
   const plannedConsumption: ConsumptionRecord[] = [];
@@ -273,7 +311,7 @@ export async function computePlanSet(
     const dinnerMidpoint = getDinnerMidpoint(dinnerWindow);
 
     try {
-      const planResult = await planTonightWithOptions(
+      let planResult = await planTonightWithOptions(
         household_id,
         dinnerMidpoint,
         calendar_blocks.filter((b) => {
@@ -282,6 +320,86 @@ export async function computePlanSet(
         }),
         dpeOptions
       );
+
+      // Stability band check: compare with existing plan if any
+      const existingRecipe = existingRecipesByDate.get(dateLocal);
+      if (existingRecipe) {
+        const newScore = planResult.reasoning_trace.eligible_recipes?.find(
+          (r) => r.recipe === planResult.recipe.slug
+        )?.scores?.final ?? 0;
+
+        // Calculate stability threshold: new score must exceed old by more than band %
+        const stabilityThreshold = existingRecipe.score * (1 + stabilityBandPct / 100);
+        const withinBand = newScore <= stabilityThreshold;
+
+        if (withinBand && planResult.recipe.slug !== existingRecipe.slug) {
+          // New recipe is not significantly better, consider keeping the old one
+          // But only if the old recipe is still available (not excluded)
+          const oldIsExcluded = dayExclusions.includes(existingRecipe.slug);
+
+          if (!oldIsExcluded) {
+            // Keep the old recipe - record decision and skip to next iteration
+            stabilityDecisions.push({
+              date_local: dateLocal,
+              kept_recipe: existingRecipe.slug,
+              new_best_recipe: planResult.recipe.slug,
+              decision: 'kept',
+              reason: `New score ${newScore.toFixed(1)} not significantly better than existing ${existingRecipe.score.toFixed(1)} (threshold ${stabilityThreshold.toFixed(1)})`,
+              old_score: existingRecipe.score,
+              new_score: newScore,
+              within_band: true,
+            });
+
+            // Re-run DPE with the old recipe as preferred to maintain consistency
+            const dpeOptionsWithPreferred: DPEOptionsV06 = {
+              ...dpeOptions,
+              intentOverride: {
+                ...intentOverride,
+                date_local: dateLocal,
+                preferred_recipe_slugs: [
+                  existingRecipe.slug,
+                  ...(intentOverride?.preferred_recipe_slugs || []),
+                ],
+              },
+            };
+
+            planResult = await planTonightWithOptions(
+              household_id,
+              dinnerMidpoint,
+              calendar_blocks.filter((b) => {
+                const blockDate = format(parseISO(b.starts_at), 'yyyy-MM-dd');
+                return blockDate === dateLocal;
+              }),
+              dpeOptionsWithPreferred
+            );
+          } else {
+            // Old recipe is excluded, must use new one
+            stabilityDecisions.push({
+              date_local: dateLocal,
+              kept_recipe: null,
+              new_best_recipe: planResult.recipe.slug,
+              decision: 'changed',
+              reason: `Old recipe ${existingRecipe.slug} is excluded, using new recipe`,
+              old_score: existingRecipe.score,
+              new_score: newScore,
+              within_band: true,
+            });
+          }
+        } else if (planResult.recipe.slug !== existingRecipe.slug) {
+          // New recipe is significantly better
+          stabilityDecisions.push({
+            date_local: dateLocal,
+            kept_recipe: null,
+            new_best_recipe: planResult.recipe.slug,
+            decision: 'changed',
+            reason: `New score ${newScore.toFixed(1)} exceeds threshold ${stabilityThreshold.toFixed(1)}`,
+            old_score: existingRecipe.score,
+            new_score: newScore,
+            within_band: false,
+          });
+        }
+        // If same recipe, no stability decision to record
+      }
 
       // Record variety penalties
       const recipeIngredients = planResult.inventory_to_consume.map(
@@ -377,7 +495,7 @@ export async function computePlanSet(
     },
     recent_consumption_summary: consumptionSummary,
     variety_penalties_applied: perDayVarietyPenalties,
-    stability_decisions: [], // Filled in for recompute scenarios
+    stability_decisions: stabilityDecisions,
     dependency_changes: [],
     per_day: perDayTraces,
   };
@@ -424,12 +542,13 @@ export async function computePlanSet(
   // ─────────────────────────────────────────────────────────────────────────
   // Step 11: Emit event
   // ─────────────────────────────────────────────────────────────────────────
-  emitEvent({
+  emitEventV06({
     householdId: household_id,
-    eventType: EventTypesV06.PLAN_SET_PROPOSED as 'plan_proposed', // Type cast for now
+    eventType: EventTypesV06.PLAN_SET_PROPOSED,
     payload: {
-      plan_id: planSetId,
-      recipe_slug: dayResults.map((d) => d.recipe.slug).join(','),
+      plan_set_id: planSetId,
+      horizon: normalizedHorizon,
+      recipe_slugs: dayResults.map((d) => d.recipe.slug),
     },
   }).catch((err) => {
     console.error('[Replanning] Failed to emit plan_set_proposed event:', err);
@@ -607,6 +726,8 @@ function formatDayName(dateLocal: string): string {
 
 /**
  * Swap a single day in a plan set.
+ * v0.6.1: Now dependency-aware - accounts for consumption from prior days
+ * and rebuilds variety profile correctly.
  *
  * @param planSetId - Plan set ID
  * @param dateLocal - Date to swap
@@ -621,7 +742,9 @@ export async function swapDay(
   const planSet = await prisma.planSet.findUnique({
     where: { id: planSetId },
     include: {
-      items: { orderBy: { dateLocal: 'asc' } },
+      items: {
+        orderBy: { dateLocal: 'asc' },
+      },
       household: true,
     },
   });
@@ -630,7 +753,7 @@ export async function swapDay(
     throw new Error(`PlanSet not found: ${planSetId}`);
   }
 
-  const itemToSwap = planSet.items.find((i) => i.dateLocal === dateLocal);
+  const itemToSwap = planSet.items.find((i: { dateLocal: string }) => i.dateLocal === dateLocal);
   if (!itemToSwap) {
     throw new Error(`No item found for date ${dateLocal} in plan set`);
   }
@@ -641,14 +764,11 @@ export async function swapDay(
 
   // Also exclude other recipes in the horizon
   const otherSlugs = planSet.items
-    .filter((i) => i.dateLocal !== dateLocal)
-    .map((i) => i.recipeSlug);
+    .filter((i: { dateLocal: string }) => i.dateLocal !== dateLocal)
+    .map((i: { recipeSlug: string }) => i.recipeSlug);
   allExcludes.push(...otherSlugs);
 
-  // Recompute just this day
-  const horizon = planSet.horizonJson as Horizon;
-
-  // Load inventory
+  // Load current inventory
   const inventoryRaw = await prisma.inventoryItem.findMany({
     where: {
       householdId: planSet.householdId,
@@ -668,6 +788,93 @@ export async function swapDay(
     expirationDate: item.expirationDate,
   }));
 
+  // v0.6.1: Build shadow inventory accounting for consumption from prior days
+  const shadowInventory = createShadowInventory(inventory, new Date());
+
+  // Apply consumption from days BEFORE the swap date
+  // Load Plans for prior days to get consumption data
+  const priorDayItems = planSet.items.filter(
+    (i: { dateLocal: string; planId: string | null }) => i.dateLocal < dateLocal && i.planId
+  );
+
+  for (const priorItem of priorDayItems) {
+    if (priorItem.planId) {
+      const priorPlan = await prisma.plan.findUnique({
+        where: { id: priorItem.planId },
+        include: {
+          consumptions: { include: { inventoryItem: true } },
+          selectedRecipe: true,
+        },
+      });
+
+      if (priorPlan?.consumptions) {
+        applyShadowConsumption(
+          shadowInventory,
+          priorPlan.consumptions.map((c) => ({
+            inventoryItemId: c.inventoryItemId,
+            consumedQuantity: c.consumedQuantity ? Number(c.consumedQuantity) : null,
+          }))
+        );
+      }
+    }
+  }
+
+  // v0.6.1: Build variety profile including prior days in the plan set
+  // Load variety data from prior plans
+  const priorDayConsumption: ConsumptionRecord[] = [];
+  for (const priorItem of priorDayItems) {
+    if (priorItem.planId) {
+      const priorPlan = await prisma.plan.findUnique({
+        where: { id: priorItem.planId },
+        include: {
+          consumptions: { include: { inventoryItem: true } },
+          selectedRecipe: true,
+        },
+      });
+
+      if (priorPlan?.selectedRecipe) {
+        priorDayConsumption.push({
+          date_local: priorItem.dateLocal,
+          recipe_slug: priorPlan.selectedRecipe.slug,
+          ingredients_used: priorPlan.consumptions.map((c) => c.inventoryItem.canonicalName),
+          tags: Array.isArray(priorPlan.selectedRecipe.tags)
+            ? priorPlan.selectedRecipe.tags as string[]
+            : [],
+        });
+      }
+    }
+  }
+
+  // Load historical consumption for variety profile
+  const consumptionEvents = await prisma.eventLog.findMany({
+    where: {
+      householdId: planSet.householdId,
+      eventType: EventTypesV06.CONSUMPTION_LOGGED,
+    },
+    orderBy: { createdAt: 'desc' },
+    take: 50,
+  });
+
+  const historicalConsumption: ConsumptionRecord[] = consumptionEvents.map((e) => {
+    const payload = e.payload as {
+      date_local: string;
+      recipe_slug: string;
+      ingredients_used: string[];
+      tags: string[];
+    };
+    return {
+      date_local: payload.date_local,
+      recipe_slug: payload.recipe_slug,
+      ingredients_used: payload.ingredients_used || [],
+      tags: payload.tags || [],
+    };
+  });
+
+  const allConsumption = [...historicalConsumption, ...priorDayConsumption];
+  const varietyProfile = buildRecentConsumptionProfile(allConsumption, 7, dateLocal);
+
+  const expiringIngredients = getExpiringIngredients(shadowInventory);
+
   // Build dinner window
   const dinnerWindow = buildDinnerWindow(
     dateLocal,
@@ -677,14 +884,17 @@ export async function swapDay(
     planSet.household.dinnerLatestLocal
   );
 
-  const shadowInventory = createShadowInventory(inventory, new Date());
-  const expiringIngredients = getExpiringIngredients(shadowInventory);
-
   const dpeOptions: DPEOptionsV06 = {
     excludeRecipeSlugs: allExcludes,
-    varietyProfile: buildRecentConsumptionProfile([], 7, dateLocal),
+    varietyProfile,
     expiringIngredients,
-    shadowInventory: inventory,
+    shadowInventory: shadowInventory.map((i) => ({
+      id: i.id,
+      canonicalName: i.canonicalName,
+      quantity: i.quantity,
+      unit: i.unit,
+      expirationDate: i.expirationDate,
+    })),
   };
 
   const planResult = await planTonightWithOptions(
@@ -705,11 +915,12 @@ export async function swapDay(
   });
 
   // Emit swap event
-  emitEvent({
+  emitEventV06({
     householdId: planSet.householdId,
-    eventType: EventTypesV06.PLAN_SWAPPED as 'plan_swapped',
+    eventType: EventTypesV06.PLAN_SET_ITEM_SWAPPED,
     payload: {
-      plan_id: planSetId,
+      plan_set_id: planSetId,
+      date_local: dateLocal,
       old_recipe_slug: oldSlug,
       new_recipe_slug: planResult.recipe.slug,
     },
@@ -766,12 +977,11 @@ export async function confirmPlanSet(planSetId: string): Promise<PlanResponse> {
   });
 
   // Emit event
-  emitEvent({
+  emitEventV06({
     householdId: planSet.householdId,
-    eventType: EventTypesV06.PLAN_CONFIRMED as 'plan_confirmed',
+    eventType: EventTypesV06.PLAN_SET_CONFIRMED,
     payload: {
-      plan_id: planSetId,
-      recipe_slug: planSet.items.map((i) => i.recipeSlug).join(','),
+      plan_set_id: planSetId,
     },
   }).catch(console.error);
 
@@ -805,13 +1015,12 @@ export async function invalidatePlanSets(
       data: { status: 'overridden' },
     });
 
-    emitEvent({
+    emitEventV06({
       householdId,
-      eventType: EventTypesV06.PLAN_SWAPPED as 'plan_swapped', // Using existing event type
+      eventType: EventTypesV06.PLAN_SET_OVERRIDDEN,
       payload: {
-        plan_id: planSet.id,
-        old_recipe_slug: 'n/a',
-        new_recipe_slug: reason,
+        plan_set_id: planSet.id,
+        reason,
       },
     }).catch(console.error);
   }

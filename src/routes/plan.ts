@@ -34,6 +34,7 @@ router.post('/tonight', async (req: Request, res: Response, next: NextFunction) 
 });
 
 // POST /v1/plan/:planId/commit - Commit a plan (mark as cooked/skipped)
+// v0.6.1: Now always emits consumption_logged when status is 'cooked'
 router.post('/:planId/commit', async (req: Request<{ planId: string }>, res: Response, next: NextFunction) => {
   try {
     const planId = req.params.planId;
@@ -41,94 +42,106 @@ router.post('/:planId/commit', async (req: Request<{ planId: string }>, res: Res
 
     const plan = await prisma.plan.findUnique({
       where: { id: planId },
-      include: { consumptions: true },
+      include: {
+        consumptions: { include: { inventoryItem: true } },
+        selectedRecipe: true,
+      },
     });
 
     if (!plan) {
       throw new PlanNotFoundError(planId);
     }
 
-    if (plan.status !== 'proposed') {
+    if (plan.status !== 'proposed' && plan.status !== 'confirmed') {
       throw new InvalidPlanStatusError(plan.status, data.status);
     }
 
+    const warnings: string[] = [];
+    const ingredientsUsed: string[] = [];
+
     // If status is "cooked", apply inventory deductions
     if (data.status === 'cooked') {
-      const warnings: string[] = [];
-
       for (const consumption of plan.consumptions) {
-        const item = await prisma.inventoryItem.findUnique({
-          where: { id: consumption.inventoryItemId },
-        });
+        ingredientsUsed.push(consumption.inventoryItem.canonicalName);
 
-        if (item) {
-          // Handle unknown quantity items - set assumedDepleted instead of decrementing
-          if (consumption.consumedUnknown || consumption.consumedQuantity === null) {
-            await prisma.inventoryItem.update({
-              where: { id: consumption.inventoryItemId },
-              data: { assumedDepleted: true, opened: true },
-            });
-            warnings.push(
-              `UNKNOWN_QTY_CONSUMED: ${item.canonicalName} marked as assumed depleted`
-            );
-            continue;
-          }
-
-          // Handle estimate quantities - log warning
-          if (item.quantityConfidence === 'estimate') {
-            warnings.push(
-              `ESTIMATE_QTY_USED: ${item.canonicalName} (${item.quantity}${item.unit} estimate) - actual may vary`
-            );
-          }
-
-          // Normal quantity deduction
-          const currentQty = item.quantity !== null ? Number(item.quantity) : 0;
-          const toConsume = Number(consumption.consumedQuantity);
-          let newQty = currentQty - toConsume;
-
-          if (newQty < 0) {
-            warnings.push(
-              `INVENTORY_DRIFT_CLAMPED: ${item.canonicalName} clamped from ${newQty} to 0`
-            );
-            newQty = 0;
-          }
-
+        // Handle unknown quantity items - set assumedDepleted instead of decrementing
+        if (consumption.consumedUnknown || consumption.consumedQuantity === null) {
           await prisma.inventoryItem.update({
             where: { id: consumption.inventoryItemId },
-            data: { quantity: newQty },
+            data: { assumedDepleted: true, opened: true },
           });
+          warnings.push(
+            `UNKNOWN_QTY_CONSUMED: ${consumption.inventoryItem.canonicalName} marked as assumed depleted`
+          );
+          continue;
         }
+
+        // Handle estimate quantities - log warning
+        if (consumption.inventoryItem.quantityConfidence === 'estimate') {
+          warnings.push(
+            `ESTIMATE_QTY_USED: ${consumption.inventoryItem.canonicalName} (${consumption.inventoryItem.quantity}${consumption.inventoryItem.unit} estimate) - actual may vary`
+          );
+        }
+
+        // Normal quantity deduction
+        const currentQty = consumption.inventoryItem.quantity !== null
+          ? Number(consumption.inventoryItem.quantity)
+          : 0;
+        const toConsume = Number(consumption.consumedQuantity);
+        let newQty = currentQty - toConsume;
+
+        if (newQty < 0) {
+          warnings.push(
+            `INVENTORY_DRIFT_CLAMPED: ${consumption.inventoryItem.canonicalName} clamped from ${newQty} to 0`
+          );
+          newQty = 0;
+        }
+
+        await prisma.inventoryItem.update({
+          where: { id: consumption.inventoryItemId },
+          data: { quantity: newQty },
+        });
       }
 
-      // Update DPE trace with warnings if any
-      if (warnings.length > 0) {
-        const existingTrace = plan.dpeTraceJson as Record<string, unknown>;
-        const existingWarnings = (existingTrace.warnings as string[]) || [];
-        await prisma.plan.update({
-          where: { id: planId },
-          data: {
-            status: data.status,
-            dpeTraceJson: {
-              ...existingTrace,
-              warnings: [...existingWarnings, ...warnings],
-            },
-          },
-        });
-      } else {
-        await prisma.plan.update({
-          where: { id: planId },
-          data: { status: data.status },
-        });
-      }
-    } else {
-      // Just update status for skipped/overridden
-      await prisma.plan.update({
-        where: { id: planId },
-        data: { status: data.status },
+      // v0.6.1: Always emit consumption_logged event for variety tracking
+      const planDateLocal = plan.planDateLocal.toISOString().split('T')[0];
+      const recipeTags = Array.isArray(plan.selectedRecipe.tags)
+        ? plan.selectedRecipe.tags as string[]
+        : [];
+
+      emitConsumptionLogged(
+        plan.householdId,
+        planDateLocal,
+        plan.selectedRecipe.slug,
+        ingredientsUsed,
+        recipeTags
+      ).catch((err) => {
+        console.error('[Plan Commit] Failed to emit consumption_logged:', err);
       });
     }
 
-    res.json({ plan_id: planId, status: data.status });
+    // Update plan status and DPE trace
+    const existingTrace = plan.dpeTraceJson as Record<string, unknown>;
+    const existingWarnings = (existingTrace.warnings as string[]) || [];
+
+    const updatedTrace = warnings.length > 0
+      ? { ...existingTrace, warnings: [...existingWarnings, ...warnings] }
+      : existingTrace;
+
+    await prisma.plan.update({
+      where: { id: planId },
+      data: {
+        status: data.status,
+        dpeTraceJson: updatedTrace as object,
+      },
+    });
+
+    res.json({
+      plan_id: planId,
+      status: data.status,
+      ingredients_consumed: ingredientsUsed,
+      warnings,
+    });
   } catch (err) {
     next(err);
   }
