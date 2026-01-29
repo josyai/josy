@@ -21,6 +21,7 @@ import { planTonight } from './dpe';
 import { canonicalizeIngredientName, validateUnit } from '../utils/canonicalize';
 import { ReasoningTrace } from '../types';
 import { AppError } from '../utils/errors';
+import { buildErrorMessage } from './messaging';
 
 export interface ConversationResponse {
   message: string;
@@ -121,8 +122,9 @@ async function handlePlanTonight(householdId: string, phoneNumber: string): Prom
     }
 
     console.error('Plan error:', error);
+    // v0.7: Use messaging module for error messages
     return {
-      message: 'Something went wrong. Please try again.',
+      message: buildErrorMessage('INTERNAL'),
       success: false,
     };
   }
@@ -358,14 +360,23 @@ export async function handleMessage(
       };
 
     case 'SWAP_DAY':
+      // v0.7: Use normalized day if available
+      const dayDisplay = intent.dayNormalized || intent.day;
       return {
-        message: intent.day
-          ? `Swapping ${intent.day}'s dinner is available via the API. WhatsApp support coming soon!`
-          : `To swap a day, say "swap Monday" or "swap tomorrow". Full support available via API.`,
-        success: true,
+        message: dayDisplay
+          ? `Swapping ${dayDisplay}'s dinner is available via the API. WhatsApp support coming soon!`
+          : buildErrorMessage('INVALID_DAY'),
+        success: !!dayDisplay,
       };
 
     case 'CONFIRM_PLAN':
+      // v0.7: Check if there's an active plan to confirm
+      if (!session.lastPlanId) {
+        return {
+          message: buildErrorMessage('NO_ACTIVE_PLAN'),
+          success: false,
+        };
+      }
       return {
         message: `Plan confirmed! Confirming multi-day plans is available via the API (POST /v1/plan_set/:id/confirm).`,
         success: true,

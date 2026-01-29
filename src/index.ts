@@ -6,6 +6,7 @@ import { inventoryRoutes } from './routes/inventory';
 import { recipeRoutes } from './routes/recipes';
 import { householdRoutes } from './routes/households';
 import { whatsappRoutes } from './routes/whatsapp';
+import { debugRoutes } from './routes/debug';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -18,6 +19,7 @@ app.use('/v1/plan', planRoutes);
 app.use('/v1/inventory', inventoryRoutes);
 app.use('/v1/recipes', recipeRoutes);
 app.use('/v1/households', householdRoutes);
+app.use('/v1/debug', debugRoutes);
 
 // WhatsApp Webhook (Phase 4)
 app.use('/webhooks/whatsapp', whatsappRoutes);

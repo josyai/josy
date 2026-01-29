@@ -497,8 +497,21 @@ export interface DependencyChange {
   new_recipe: string;
 }
 
+// Trace Summary for v0.7 observability
+export interface TraceSummary {
+  top_factors: string[];
+  penalties: string[];
+  kept_days: number;
+  changed_days: number;
+}
+
 // PlanSet Reasoning Trace
 export interface PlanSetReasoningTrace {
+  // v0.7 observability fields
+  trace_id: string;
+  trace_version: string;
+  trace_summary: TraceSummary;
+
   inputs_summary: {
     horizon: Horizon;
     intent_overrides_count: number;
@@ -550,7 +563,15 @@ export const EventTypesV06 = {
 export type EventTypeV06 = typeof EventTypesV06[keyof typeof EventTypesV06];
 
 export interface EventPayloadV06 extends EventPayload {
-  [EventTypesV06.PLAN_SET_PROPOSED]: { plan_set_id: string; horizon: Horizon; recipe_slugs: string[] };
+  // v0.7: Extended with observability fields (trace_id, day_count, grocery_item_count)
+  [EventTypesV06.PLAN_SET_PROPOSED]: {
+    plan_set_id: string;
+    horizon: Horizon;
+    recipe_slugs: string[];
+    trace_id?: string;
+    day_count?: number;
+    grocery_item_count?: number;
+  };
   [EventTypesV06.PLAN_SET_CONFIRMED]: { plan_set_id: string };
   [EventTypesV06.PLAN_SET_OVERRIDDEN]: { plan_set_id: string; reason: string };
   [EventTypesV06.PLAN_SET_ITEM_SWAPPED]: { plan_set_id: string; date_local: string; old_recipe_slug: string; new_recipe_slug: string };

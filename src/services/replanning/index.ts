@@ -25,6 +25,7 @@ import {
   NormalizedGroceryList,
   ConsumptionRecord,
   EventTypesV06,
+  TraceSummary,
 } from '../../types';
 import {
   computePlanningDates,
@@ -48,7 +49,14 @@ import {
 } from './variety';
 import { planTonightWithOptions, DPEOptionsV06 } from '../dpe';
 import { normalizeGroceryAddons } from '../grocery';
-import { buildDinnerNotification, formatForWhatsApp } from '../notifications';
+import {
+  buildSummaryMessageFromResponse,
+  buildDayMessageFromResponse,
+  buildSwapResultMessage,
+  buildConfirmMessage,
+  extractWhyReasons,
+  buildPlanSetSummaryMessage,
+} from '../messaging';
 import { emitEvent, emitEventV06 } from '../events';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -422,14 +430,8 @@ export async function computePlanSet(
         ? normalizeGroceryAddons(planResult.grocery_addons)
         : null;
 
-      const notification = buildDinnerNotification(
-        planResult.recipe.name,
-        planResult.reasoning_trace,
-        dayGroceryList,
-        planResult.plan_id
-      );
-
-      dayResults.push({
+      // Build day response (without assistant_message for now - will add via messaging module)
+      const dayResponse: PlanDayResponse = {
         date_local: dateLocal,
         meal_slot: 'DINNER',
         plan_id: planResult.plan_id,
@@ -441,9 +443,14 @@ export async function computePlanSet(
         inventory_to_consume: planResult.inventory_to_consume,
         grocery_addons: planResult.grocery_addons,
         grocery_list_normalized: dayGroceryList,
-        assistant_message: formatForWhatsApp(notification),
+        assistant_message: '', // Will be set below
         reasoning_trace: planResult.reasoning_trace,
-      });
+      };
+
+      // v0.7: Use messaging module for assistant message
+      dayResponse.assistant_message = buildDayMessageFromResponse(dayResponse);
+
+      dayResults.push(dayResponse);
 
       // Update tracking
       usedRecipeSlugsInHorizon.push(planResult.recipe.slug);
@@ -486,7 +493,41 @@ export async function computePlanSet(
     buildRecentConsumptionProfile(consumptionRecords, varietyWindowDays, planningDates[0])
   );
 
+  // v0.7: Generate trace_id and build trace_summary
+  const traceId = uuidv4();
+
+  // Build trace summary for observability
+  const topFactors: string[] = [];
+  if (inventory.length > 0) {
+    topFactors.push(`${inventory.length} inventory items`);
+  }
+  if (consumptionSummary.meals_found > 0) {
+    topFactors.push(`${consumptionSummary.meals_found} recent meals`);
+  }
+  if (calendar_blocks.length > 0) {
+    topFactors.push(`${calendar_blocks.length} calendar blocks`);
+  }
+
+  const penalties: string[] = [];
+  for (const [date, dayPenalties] of Object.entries(perDayVarietyPenalties)) {
+    if (dayPenalties.length > 0) {
+      penalties.push(`${date}: ${dayPenalties.length} variety penalties`);
+    }
+  }
+
+  const traceSummary: TraceSummary = {
+    top_factors: topFactors.slice(0, 5),
+    penalties: penalties.slice(0, 5),
+    kept_days: stabilityDecisions.filter((s) => s.decision === 'kept').length,
+    changed_days: stabilityDecisions.filter((s) => s.decision === 'changed').length,
+  };
+
   const planSetTrace: PlanSetReasoningTrace = {
+    // v0.7 observability fields
+    trace_id: traceId,
+    trace_version: '0.7',
+    trace_summary: traceSummary,
+
     inputs_summary: {
       horizon: normalizedHorizon,
       intent_overrides_count: intent_overrides.length,
@@ -540,7 +581,7 @@ export async function computePlanSet(
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Step 11: Emit event
+  // Step 11: Emit event (v0.7 enriched payload)
   // ─────────────────────────────────────────────────────────────────────────
   emitEventV06({
     householdId: household_id,
@@ -549,6 +590,10 @@ export async function computePlanSet(
       plan_set_id: planSetId,
       horizon: normalizedHorizon,
       recipe_slugs: dayResults.map((d) => d.recipe.slug),
+      // v0.7 observability enrichment
+      trace_id: traceId,
+      day_count: dayResults.length,
+      grocery_item_count: consolidatedGroceryList?.items?.length ?? 0,
     },
   }).catch((err) => {
     console.error('[Replanning] Failed to emit plan_set_proposed event:', err);
@@ -675,49 +720,22 @@ async function buildPlanSetResponse(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: Build assistant message for horizon
+// v0.7: Now uses messaging module for consistent output
 // ─────────────────────────────────────────────────────────────────────────────
 
 function buildHorizonAssistantMessage(
   days: PlanDayResponse[],
   groceryList: NormalizedGroceryList | null
 ): string {
-  if (days.length === 1) {
-    return days[0].assistant_message;
-  }
-
-  const lines: string[] = [];
-  lines.push(`*Your dinner plan for the next ${days.length} days:*`);
-  lines.push('');
-
-  for (const day of days) {
-    const dayName = formatDayName(day.date_local);
-    lines.push(`*${dayName}:* ${day.recipe.name}`);
-  }
-
-  if (groceryList && groceryList.items.length > 0) {
-    lines.push('');
-    lines.push(`_${groceryList.summary}_`);
-  }
-
-  lines.push('');
-  lines.push('Reply "confirm" to confirm or "swap <day>" to change a day.');
-
-  return lines.join('\n');
-}
-
-function formatDayName(dateLocal: string): string {
-  const date = parseISO(dateLocal);
-  const today = new Date();
-  const tomorrow = new Date(today);
-  tomorrow.setDate(tomorrow.getDate() + 1);
-
-  if (format(date, 'yyyy-MM-dd') === format(today, 'yyyy-MM-dd')) {
-    return 'Tonight';
-  }
-  if (format(date, 'yyyy-MM-dd') === format(tomorrow, 'yyyy-MM-dd')) {
-    return 'Tomorrow';
-  }
-  return format(date, 'EEEE'); // Day name
+  // v0.7: Use messaging module for consistent assistant messages
+  return buildPlanSetSummaryMessage({
+    dayCount: days.length,
+    days: days.map((d) => ({
+      dateLocal: d.date_local,
+      recipeName: d.recipe.name,
+    })),
+    groceryList,
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

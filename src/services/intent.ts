@@ -1,19 +1,65 @@
 /**
- * Intent Detection Module
+ * Intent Detection Module v0.7
  *
  * Simple, deterministic intent matching for WhatsApp messages.
  * No NLP required - just keyword/pattern matching.
+ *
+ * v0.7 Improvements:
+ * - Day name normalization (tuesday, TUES, tue → TUE)
+ * - Extended confirm variants
+ * - Better inventory add parsing
  */
 
 export type Intent =
   | { type: 'PLAN_TONIGHT' }
   | { type: 'PLAN_NEXT'; days: number }
-  | { type: 'SWAP_DAY'; day?: string }
+  | { type: 'SWAP_DAY'; day?: string; dayNormalized?: string }
   | { type: 'CONFIRM_PLAN' }
   | { type: 'EXPLAIN_LAST_PLAN' }
   | { type: 'INVENTORY_ADD'; item: string; quantity?: number; unit?: string }
   | { type: 'INVENTORY_USED'; item: string }
   | { type: 'UNKNOWN'; raw: string };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.7: Day Name Normalization
+// ─────────────────────────────────────────────────────────────────────────────
+
+const DAY_ALIASES: Record<string, string> = {
+  // Full names
+  monday: 'MON',
+  tuesday: 'TUE',
+  wednesday: 'WED',
+  thursday: 'THU',
+  friday: 'FRI',
+  saturday: 'SAT',
+  sunday: 'SUN',
+  // Short forms (3 letter)
+  mon: 'MON',
+  tue: 'TUE',
+  wed: 'WED',
+  thu: 'THU',
+  fri: 'FRI',
+  sat: 'SAT',
+  sun: 'SUN',
+  // Alternate short forms
+  tues: 'TUE',
+  thur: 'THU',
+  thurs: 'THU',
+  // Relative
+  tonight: 'TODAY',
+  today: 'TODAY',
+  tomorrow: 'TOMORROW',
+};
+
+/**
+ * Normalize a day reference to a standard form.
+ * e.g., "tuesday" → "TUE", "TUES" → "TUE", "tomorrow" → "TOMORROW"
+ */
+export function normalizeDay(day: string): string | undefined {
+  if (!day) return undefined;
+  const normalized = day.toLowerCase().trim();
+  return DAY_ALIASES[normalized] || day.toUpperCase();
+}
 
 /**
  * Common unit mappings for natural language
@@ -107,33 +153,60 @@ function normalizeItemName(text: string): string {
 export function detectIntent(message: string): Intent {
   const text = message.trim().toLowerCase();
 
-  // v0.6: Check for confirm intent
+  // v0.7: Extended confirm intent variants
+  const confirmVariants = [
+    'confirm',
+    'yes',
+    'ok',
+    'okay',
+    'sure',
+    'yep',
+    'yeah',
+    'yup',
+    'sounds good',
+    'looks good',
+    'perfect',
+    'great',
+    'awesome',
+    'done',
+    'go for it',
+    'let\'s do it',
+    'that works',
+    'good',
+    'fine',
+    'confirm plan',
+    'confirm the plan',
+    'lock it in',
+    'i\'m in',
+    'yes please',
+  ];
+
   if (
-    text === 'confirm' ||
-    text === 'yes' ||
-    text === 'ok' ||
-    text === 'sounds good' ||
-    text === 'looks good' ||
+    confirmVariants.includes(text) ||
     text.startsWith('yes ') ||
-    text.includes('confirm the plan') ||
-    text.includes('that works')
+    text.startsWith('ok ') ||
+    text.startsWith('sure ')
   ) {
     return { type: 'CONFIRM_PLAN' };
   }
 
-  // v0.6: Check for swap intent
+  // v0.7: Enhanced swap intent with day normalization
   const swapPatterns = [
     /^swap\s+(.+)/i,
     /^change\s+(.+)/i,
     /^different\s+(?:meal\s+)?(?:for\s+)?(.+)/i,
     /^something else(?:\s+(?:for\s+)?(.+))?/i,
+    /^try\s+(?:something\s+)?(?:else|different)(?:\s+(?:for\s+)?(.+))?/i,
+    /^not\s+(?:that|this)(?:\s+(?:for\s+)?(.+))?/i,
+    /^another\s+(?:option|recipe)(?:\s+(?:for\s+)?(.+))?/i,
   ];
 
   for (const pattern of swapPatterns) {
     const match = text.match(pattern);
     if (match) {
       const day = match[1]?.trim() || undefined;
-      return { type: 'SWAP_DAY', day };
+      const dayNormalized = day ? normalizeDay(day) : undefined;
+      return { type: 'SWAP_DAY', day, dayNormalized };
     }
   }
 
